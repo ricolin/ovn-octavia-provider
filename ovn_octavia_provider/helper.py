@@ -70,15 +70,19 @@ class OvnProviderHelper():
     def _init_lb_actions(self):
         self._lb_request_func_maps = {
             ovn_const.REQ_TYPE_LB_CREATE: self.lb_create,
+            ovn_const.REQ_TYPE_LB_SYNC: self.lb_sync,
             ovn_const.REQ_TYPE_LB_DELETE: self.lb_delete,
             ovn_const.REQ_TYPE_LB_UPDATE: self.lb_update,
             ovn_const.REQ_TYPE_LISTENER_CREATE: self.listener_create,
+            ovn_const.REQ_TYPE_LISTENER_SYNC: self.listener_sync,
             ovn_const.REQ_TYPE_LISTENER_DELETE: self.listener_delete,
             ovn_const.REQ_TYPE_LISTENER_UPDATE: self.listener_update,
             ovn_const.REQ_TYPE_POOL_CREATE: self.pool_create,
+            ovn_const.REQ_TYPE_POOL_SYNC: self.pool_sync,
             ovn_const.REQ_TYPE_POOL_DELETE: self.pool_delete,
             ovn_const.REQ_TYPE_POOL_UPDATE: self.pool_update,
             ovn_const.REQ_TYPE_MEMBER_CREATE: self.member_create,
+            ovn_const.REQ_TYPE_MEMBER_SYNC: self.member_sync,
             ovn_const.REQ_TYPE_MEMBER_DELETE: self.member_delete,
             ovn_const.REQ_TYPE_MEMBER_UPDATE: self.member_update,
             ovn_const.REQ_TYPE_LB_CREATE_LRP_ASSOC: self.lb_create_lrp_assoc,
@@ -86,6 +90,7 @@ class OvnProviderHelper():
             ovn_const.REQ_TYPE_HANDLE_VIP_FIP: self.handle_vip_fip,
             ovn_const.REQ_TYPE_HANDLE_MEMBER_DVR: self.handle_member_dvr,
             ovn_const.REQ_TYPE_HM_CREATE: self.hm_create,
+            ovn_const.REQ_TYPE_HM_SYNC: self.hm_sync,
             ovn_const.REQ_TYPE_HM_UPDATE: self.hm_update,
             ovn_const.REQ_TYPE_HM_DELETE: self.hm_delete,
             ovn_const.REQ_TYPE_HM_UPDATE_EVENT: self.hm_update_event,
@@ -554,10 +559,11 @@ class OvnProviderHelper():
         # or updated exising, empty one.
         return self._find_ovn_lbs(lb_id, protocol=protocol)
 
-    def _find_ovn_lb_with_pool_key(self, pool_key):
-        lbs = self.ovn_nbdb_api.db_list_rows(
-            'Load_Balancer').execute(check_error=True)
-        for lb in lbs:
+    def _find_ovn_lb_with_pool_key(self, pool_key, loadbalancers=[]):
+        if not loadbalancers:
+            loadbalancers = self.ovn_nbdb_api.db_list_rows(
+                'Load_Balancer').execute(check_error=True)
+        for lb in loadbalancers:
             # Skip load balancers used by port forwarding plugin
             if lb.external_ids.get(ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY) == (
                     ovn_const.PORT_FORWARDING_PLUGIN):
@@ -565,12 +571,20 @@ class OvnProviderHelper():
             if pool_key in lb.external_ids:
                 return lb
 
-    def _find_ovn_lb_by_pool_id(self, pool_id):
+    @tenacity.retry(
+        retry=tenacity.retry_if_result(lambda x: x[1] is None),
+        wait=tenacity.wait_exponential(),
+        stop=tenacity.stop_after_delay(10),
+        reraise=True)
+    def _find_ovn_lb_by_pool_id_with_retry(self, pool_id, loadbalancers=[]):
+        return self._find_ovn_lb_by_pool_id(pool_id, loadbalancers)
+
+    def _find_ovn_lb_by_pool_id(self, pool_id, loadbalancers=[]):
         pool_key = self._get_pool_key(pool_id)
-        ovn_lb = self._find_ovn_lb_with_pool_key(pool_key)
+        ovn_lb = self._find_ovn_lb_with_pool_key(pool_key, loadbalancers)
         if not ovn_lb:
             pool_key = self._get_pool_key(pool_id, is_enabled=False)
-            ovn_lb = self._find_ovn_lb_with_pool_key(pool_key)
+            ovn_lb = self._find_ovn_lb_with_pool_key(pool_key, loadbalancers)
         return pool_key, ovn_lb
 
     def _check_ip_in_subnet(self, ip, subnet):
@@ -606,19 +620,21 @@ class OvnProviderHelper():
     def _update_lb_to_ls_association(self, ovn_lb, network_id=None,
                                      subnet_id=None, associate=True,
                                      update_ls_ref=True,
-                                     additional_vips=False):
+                                     additional_vips=False,
+                                     is_sync=False):
         # Note(froyo): Large topologies can change from the time we
         # list the ls association commands and the execution, retry
         # if this situation arises.
         commands = self._get_lb_to_ls_association_commands(
             ovn_lb, network_id, subnet_id, associate, update_ls_ref,
-            additional_vips)
+            additional_vips, is_sync=is_sync)
         self._execute_commands(commands)
 
     def _get_lb_to_ls_association_commands(self, ovn_lb, network_id=None,
                                            subnet_id=None, associate=True,
                                            update_ls_ref=True,
-                                           additional_vips=True):
+                                           additional_vips=True,
+                                           is_sync=False):
         """Update LB association with Logical Switch
 
            This function deals with updating the References of Logical Switch
@@ -641,6 +657,7 @@ class OvnProviderHelper():
                             'fetch its data.', subnet_id)
                 ls_name = None
 
+        skip_ls_lb_actions = False
         if ls_name:
             try:
                 ovn_ls = self.ovn_nbdb_api.ls_get(ls_name).execute(
@@ -653,6 +670,12 @@ class OvnProviderHelper():
                                 'not found in OVN NBDB. Exiting.',
                                 {'ls': ls_name, 'lb': ovn_lb.name})
                     return commands
+            if is_sync:
+                for ls_lb in ovn_ls.load_balancer:
+                    if str(ls_lb.uuid) == str(ovn_lb.uuid):
+                        # lb already in ls, skip assocate for sync steps
+                        skip_ls_lb_actions = True
+                        break
 
         ls_refs = ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_LS_REFS_KEY)
         if ls_refs:
@@ -663,46 +686,67 @@ class OvnProviderHelper():
         else:
             ls_refs = {}
 
-        if associate and ls_name:
-            if ls_name in ls_refs:
-                ref_ct = ls_refs[ls_name]
-                ls_refs[ls_name] = ref_ct + 1
+        if not skip_ls_lb_actions:
+            if associate and ls_name:
+                if ls_name in ls_refs:
+                    ref_ct = ls_refs[ls_name]
+                    ls_refs[ls_name] = ref_ct + 1
+                else:
+                    ls_refs[ls_name] = 1
+                    # NOTE(froyo): To cover the initial lb to ls association,
+                    # where additional vips shall be in the same network as VIP
+                    # port, and the ls_ref[vip_network_id] should take them
+                    # into account.
+                    if additional_vips:
+                        addi_vips = ovn_lb.external_ids.get(
+                            ovn_const.LB_EXT_IDS_ADDIT_VIP_KEY, '')
+                        if addi_vips:
+                            ls_refs[ls_name] += len(addi_vips.split(','))
+                    if ovn_ls:
+                        commands.append(self.ovn_nbdb_api.ls_lb_add(
+                            ovn_ls.uuid, ovn_lb.uuid, may_exist=True))
             else:
-                ls_refs[ls_name] = 1
-                # NOTE(froyo): To cover the initial lb to ls association, where
-                # additional vips shall be in the same network as VIP port,
-                # and the ls_ref[vip_network_id] should take them into account.
-                if additional_vips:
-                    addi_vips = ovn_lb.external_ids.get(
-                        ovn_const.LB_EXT_IDS_ADDIT_VIP_KEY, '')
-                    if addi_vips:
-                        ls_refs[ls_name] += len(addi_vips.split(','))
-                if ovn_ls:
-                    commands.append(self.ovn_nbdb_api.ls_lb_add(
-                        ovn_ls.uuid, ovn_lb.uuid, may_exist=True))
+                if ls_name not in ls_refs:
+                    if ovn_ls:
+                        commands.append(self.ovn_nbdb_api.ls_lb_del(
+                            ovn_ls.uuid, ovn_lb.uuid, if_exists=True))
+                    # Nothing else to be done.
+                    return commands
+
+                ref_ct = ls_refs[ls_name]
+                if ref_ct == 1:
+                    del ls_refs[ls_name]
+                    if ovn_ls:
+                        commands.append(self.ovn_nbdb_api.ls_lb_del(
+                            ovn_ls.uuid, ovn_lb.uuid, if_exists=True))
+                else:
+                    ls_refs[ls_name] = ref_ct - 1
         else:
             if ls_name not in ls_refs:
-                if ovn_ls:
-                    commands.append(self.ovn_nbdb_api.ls_lb_del(
-                        ovn_ls.uuid, ovn_lb.uuid, if_exists=True))
-                # Nothing else to be done.
-                return commands
-
-            ref_ct = ls_refs[ls_name]
-            if ref_ct == 1:
-                del ls_refs[ls_name]
-                if ovn_ls:
-                    commands.append(self.ovn_nbdb_api.ls_lb_del(
-                        ovn_ls.uuid, ovn_lb.uuid, if_exists=True))
-            else:
-                ls_refs[ls_name] = ref_ct - 1
-
+                ls_refs[ls_name] = 1
         if update_ls_ref:
-            ls_refs = {
-                ovn_const.LB_EXT_IDS_LS_REFS_KEY: jsonutils.dumps(ls_refs)}
-            commands.append(self.ovn_nbdb_api.db_set(
-                'Load_Balancer', ovn_lb.uuid,
-                ('external_ids', ls_refs)))
+            check_ls_refs = False
+            if is_sync:
+                ovn_ls_refs = ovn_lb.external_ids.get(
+                    ovn_const.LB_EXT_IDS_LS_REFS_KEY, {})
+                if ovn_ls_refs:
+                    try:
+                        ovn_ls_refs = jsonutils.loads(ovn_ls_refs)
+                    except ValueError:
+                        ovn_ls_refs = {}
+                check_ls_refs = all(
+                    k in ovn_ls_refs for k in ls_refs
+                ) and (len(ovn_ls_refs) == len(ls_refs))
+            if not is_sync or (
+                is_sync and not check_ls_refs
+            ):
+                ls_refs_dict = {
+                    ovn_const.LB_EXT_IDS_LS_REFS_KEY: jsonutils.dumps(
+                        ls_refs)
+                }
+                commands.append(self.ovn_nbdb_api.db_set(
+                    'Load_Balancer', ovn_lb.uuid,
+                    ('external_ids', ls_refs_dict)))
 
         return commands
 
@@ -738,17 +782,35 @@ class OvnProviderHelper():
                 net, ovn_lb.uuid, if_exists=True))
         return commands
 
-    def _add_lb_to_lr_association(self, ovn_lb, ovn_lr, lr_rf):
+    def _add_lb_to_lr_association(self, ovn_lb, ovn_lr, lr_rf, is_sync=False):
         commands = []
-        commands.append(
-            self.ovn_nbdb_api.lr_lb_add(ovn_lr.uuid, ovn_lb.uuid,
-                                        may_exist=True))
+        need_lr_sync = False
+        # Check if lb not in lr and needs to be added
+        if is_sync:
+            lr_lbs = [str(lr_lb.uuid) for lr_lb in ovn_lr.load_balancer]
+            if str(ovn_lb.uuid) not in lr_lbs:
+                need_lr_sync = True
+        if not is_sync or need_lr_sync:
+            commands.append(
+                self.ovn_nbdb_api.lr_lb_add(ovn_lr.uuid, ovn_lb.uuid,
+                                            may_exist=True))
         lb_vip = netaddr.IPNetwork(
             ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_VIP_KEY))
         for net in self._find_ls_for_lr(ovn_lr, ip_version=lb_vip.version):
-            commands.append(self.ovn_nbdb_api.ls_lb_add(
-                net, ovn_lb.uuid, may_exist=True))
-
+            skip_ls_lb_actions = False
+            if is_sync:
+                try:
+                    ovn_ls = self.ovn_nbdb_api.ls_get(net).execute(
+                        check_error=True)
+                    for ls_lb in ovn_ls.load_balancer:
+                        if str(ls_lb.uuid) == str(ovn_lb.uuid):
+                            # lb already in ls, skip assocate for sync steps
+                            skip_ls_lb_actions = True
+                except idlutils.RowNotFound:
+                    LOG.warning("LogicalSwitch %s could not be found.", net)
+            if not skip_ls_lb_actions:
+                commands.append(self.ovn_nbdb_api.ls_lb_add(
+                    net, ovn_lb.uuid, may_exist=True))
         if ovn_lr.name not in str(lr_rf):
             # Multiple routers in lr_rf are separated with ','
             if lr_rf:
@@ -766,21 +828,22 @@ class OvnProviderHelper():
         wait=tenacity.wait_exponential(),
         stop=tenacity.stop_after_attempt(3),
         reraise=True)
-    def _update_lb_to_lr_association(self, ovn_lb, ovn_lr, delete=False):
+    def _update_lb_to_lr_association(self, ovn_lb, ovn_lr, delete=False,
+                                     is_sync=False):
         # Note(froyo): Large topologies can change from the time we
         # list the ls associated to lr until we execute the
         # association command, retry if this situation arises.
         commands = self._get_lb_to_lr_association_commands(
-            ovn_lb, ovn_lr, delete)
+            ovn_lb, ovn_lr, delete, is_sync=is_sync)
         self._execute_commands(commands)
 
     def _update_lb_to_lr_association_by_step(self, ovn_lb, ovn_lr,
-                                             delete=False):
+                                             delete=False, is_sync=False):
         # Note(froyo): just to make association commands step by
         # step, in order to keep going on when LsLbAdd or LsLbDel
         # happen.
         commands = self._get_lb_to_lr_association_commands(
-            ovn_lb, ovn_lr, delete)
+            ovn_lb, ovn_lr, delete, is_sync=is_sync)
         for command in commands:
             try:
                 command.execute(check_error=True)
@@ -794,11 +857,12 @@ class OvnProviderHelper():
                     raise
 
     def _get_lb_to_lr_association_commands(
-            self, ovn_lb, ovn_lr, delete=False):
+            self, ovn_lb, ovn_lr, delete=False, is_sync=False):
         lr_ref = ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_LR_REF_KEY)
         if delete:
             return self._del_lb_to_lr_association(ovn_lb, ovn_lr, lr_ref)
-        return self._add_lb_to_lr_association(ovn_lb, ovn_lr, lr_ref)
+        return self._add_lb_to_lr_association(ovn_lb, ovn_lr, lr_ref,
+                                              is_sync=is_sync)
 
     def _find_ls_for_lr(self, router, ip_version):
         ls = []
@@ -987,8 +1051,12 @@ class OvnProviderHelper():
                             ips_v4)
         return vip_ips
 
-    def _refresh_lb_vips(self, ovn_lb, lb_external_ids):
+    def _refresh_lb_vips(self, ovn_lb, lb_external_ids, is_sync=False):
         vip_ips = self._frame_vip_ips(ovn_lb, lb_external_ids)
+        if is_sync and all(
+            ovn_lb.vips.get(k) == v for k, v in vip_ips.items()
+        ) and len(vip_ips) == len(ovn_lb.vips):
+            return []
         return [self.ovn_nbdb_api.db_clear('Load_Balancer', ovn_lb.uuid,
                                            'vips'),
                 self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
@@ -1040,6 +1108,155 @@ class OvnProviderHelper():
                             subnet = neutron_client.get_subnet(ip['subnet_id'])
                         break
         return port, subnet
+
+    def lb_sync(self, loadbalancer, protocol=None):
+        commands = []
+        ovn_lb = []
+        try:
+            ovn_lb = self._find_ovn_lbs_with_retry(
+                loadbalancer[constants.ID],
+                protocol=protocol)
+        except idlutils.RowNotFound:
+            LOG.debug(f"OVN loadbalancer {loadbalancer[constants.ID]} "
+                      "not found.")
+        if not ovn_lb:
+            return self.lb_create(loadbalancer, protocol)
+        ovn_lb = ovn_lb if protocol else ovn_lb[0]
+
+        port = None
+        subnet = None
+        try:
+            neutron_client = clients.get_neutron_client()
+            port, subnet = self._get_port_from_info(
+                neutron_client,
+                loadbalancer.get(constants.VIP_PORT_ID, None),
+                loadbalancer.get(constants.VIP_NETWORK_ID, None),
+                loadbalancer.get(constants.VIP_ADDRESS, None))
+        except Exception:
+            LOG.warn('Cannot get info from neutron client for loadbalancer '
+                     'sync.')
+            return False
+
+        # If protocol set make sure its lowercase
+        protocol = protocol.lower() if protocol else []
+        # In case port is not found for the vip_address we will see an
+        # exception when port['id'] is accessed.
+        external_ids = {
+            ovn_const.LB_EXT_IDS_VIP_KEY: loadbalancer[constants.VIP_ADDRESS],
+            ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY:
+                loadbalancer.get(constants.VIP_PORT_ID) or port.id,
+            'enabled': str(loadbalancer[constants.ADMIN_STATE_UP])}
+
+        # In case additional_vips was passed
+        if loadbalancer.get(constants.ADDITIONAL_VIPS):
+            addi_vip = [x['ip_address']
+                        for x in loadbalancer.get(constants.ADDITIONAL_VIPS)]
+            addi_vip_port_id = [x['port_id']
+                                for x in loadbalancer.get(
+                                    constants.ADDITIONAL_VIPS)]
+            addi_vip = ','.join(addi_vip)
+            addi_vip_port_id = ','.join(addi_vip_port_id)
+            external_ids[ovn_const.LB_EXT_IDS_ADDIT_VIP_KEY] = addi_vip
+            external_ids[ovn_const.LB_EXT_IDS_ADDIT_VIP_PORT_ID_KEY] = \
+                addi_vip_port_id
+
+        # In case vip_fip was passed - use it.
+        vip_fip = loadbalancer.get(ovn_const.LB_EXT_IDS_VIP_FIP_KEY)
+        if vip_fip:
+            external_ids[ovn_const.LB_EXT_IDS_VIP_FIP_KEY] = vip_fip
+        # In case additional_vip_fip was passed - use it.
+        additional_vip_fip = loadbalancer.get(
+            ovn_const.LB_EXT_IDS_ADDIT_VIP_FIP_KEY)
+        if additional_vip_fip:
+            external_ids[ovn_const.LB_EXT_IDS_ADDIT_VIP_FIP_KEY] = \
+                additional_vip_fip
+        # In case of lr_ref passed - use it.
+        lr_ref = loadbalancer.get(ovn_const.LB_EXT_IDS_LR_REF_KEY)
+        if lr_ref:
+            external_ids[ovn_const.LB_EXT_IDS_LR_REF_KEY] = lr_ref
+        # In case we have LB algoritm set
+        lb_algorithm = loadbalancer.get(
+            constants.LB_ALGORITHM
+        ) or constants.LB_ALGORITHM_SOURCE_IP_PORT
+        selection_fields = self._get_selection_keys(lb_algorithm) if (
+            self._are_selection_fields_supported()) else None
+
+        is_same_external_ids = all(
+            ovn_lb.external_ids.get(k) == v for k, v in external_ids.items()
+        )
+        if not is_same_external_ids:
+            commands.append(
+                self.ovn_nbdb_api.db_set(
+                    'Load_Balancer', ovn_lb.uuid,
+                    ('external_ids', external_ids))
+            )
+        if selection_fields is not None and (
+                selection_fields != ovn_lb.selection_fields):
+            commands.append(
+                self.ovn_nbdb_api.db_set(
+                    'Load_Balancer', ovn_lb.uuid,
+                    ('selection_fields', selection_fields))
+            )
+        try:
+            self._execute_commands(commands)
+            ovn_lb = self._find_ovn_lbs_with_retry(
+                loadbalancer[constants.ID],
+                protocol=protocol)
+            ovn_lb = ovn_lb if protocol else ovn_lb[0]
+
+            # NOTE(ltomasbo): If the VIP is on a provider network, it does
+            # not need to be associated to its LS
+            network = neutron_client.get_network(port.network_id)
+            if not network.provider_physical_network:
+                # NOTE(froyo): This is the association of the lb to the VIP ls
+                # so this is executed right away. For the additional vip ports
+                # this step is not required since all subnets must belong to
+                # the same subnet, so just for the VIP LB port is enough.
+                self._update_lb_to_ls_association(
+                    ovn_lb, network_id=port.network_id,
+                    associate=True, update_ls_ref=True, additional_vips=True,
+                    is_sync=True)
+            ls_name = utils.ovn_name(port.network_id)
+            ovn_ls = self.ovn_nbdb_api.ls_get(ls_name).execute(
+                check_error=True)
+            ovn_lr = self._find_lr_of_ls(ovn_ls, subnet.gateway_ip)
+            if ovn_lr:
+                try:
+                    # NOTE(froyo): This is the association of the lb to the
+                    # router associated to VIP ls and all ls connected to that
+                    # router we try atomically, if it fails we will go step by
+                    # step, discarding the associations from lb to a
+                    # non-existent ls, but we will demand the association of
+                    # lb to lr
+                    self._update_lb_to_lr_association(ovn_lb, ovn_lr,
+                                                      is_sync=True)
+                except idlutils.RowNotFound:
+                    LOG.warning("The association of loadbalancer %s to the "
+                                "logical router %s failed, trying step by "
+                                "step", ovn_lb.uuid, ovn_lr.uuid)
+                    self._update_lb_to_lr_association_by_step(ovn_lb, ovn_lr,
+                                                              is_sync=True)
+
+            # NOTE(mjozefcz): In case of LS references where passed -
+            # apply LS to the new LB. That could happend in case we
+            # need another loadbalancer for other L4 protocol.
+            ls_refs = loadbalancer.get(ovn_const.LB_EXT_IDS_LS_REFS_KEY)
+            if ls_refs:
+                try:
+                    ls_refs = jsonutils.loads(ls_refs)
+                except ValueError:
+                    ls_refs = {}
+                for ls in ls_refs:
+                    # Skip previously added LS because we don't want
+                    # to duplicate.
+                    if ls == ovn_ls.name:
+                        continue
+                    self._update_lb_to_ls_association(
+                        ovn_lb, network_id=utils.ovn_uuid(ls),
+                        associate=True, update_ls_ref=True, is_sync=True)
+        except Exception:
+            LOG.exception("Cannot finish sync loadbalancer "
+                          f"{loadbalancer[constants.ID]} to OVN.")
 
     def lb_create(self, loadbalancer, protocol=None):
         port = None
@@ -1499,7 +1716,7 @@ class OvnProviderHelper():
                 })
         return additional_vips
 
-    def listener_create(self, listener):
+    def _listener_create_or_sync(self, listener, is_sync=False):
         ovn_lb = self._get_or_create_ovn_lb(
             listener[constants.LOADBALANCER_ID],
             listener[constants.PROTOCOL],
@@ -1520,19 +1737,43 @@ class OvnProviderHelper():
         listener_info = {listener_key: external_ids[listener_key]}
         try:
             commands = []
-            commands.append(
-                self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
-                                         ('external_ids', listener_info)))
-            if not self._is_listener_in_lb(ovn_lb):
+            listener_key_need_sync = False
+            if is_sync:
+                # Check if listener_key needs to be sync
+                if (listener_key not in ovn_lb.external_ids) \
+                    or (external_ids.get(listener_key) !=
+                        ovn_lb.external_ids.get(listener_key)):
+                    listener_key_need_sync = True
+            if not is_sync or listener_key_need_sync:
                 commands.append(
-                    self.ovn_nbdb_api.db_set(
-                        'Load_Balancer', ovn_lb.uuid,
-                        ('protocol',
-                         str(listener[constants.PROTOCOL]).lower())))
-            commands.extend(self._refresh_lb_vips(ovn_lb, external_ids))
-            self._execute_commands(commands)
+                    self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
+                                             ('external_ids', listener_info)))
+            if not self._is_listener_in_lb(ovn_lb):
+                # check if is not syncing,
+                # or is syncing and protocol in lb mismatch with octavia
+                if not is_sync or (
+                    is_sync and (
+                        ovn_lb.protocol[0].lower() != str(
+                            listener[constants.PROTOCOL]).lower()
+                    )
+                ):
+                    commands.append(
+                        self.ovn_nbdb_api.db_set(
+                            'Load_Balancer', ovn_lb.uuid,
+                            ('protocol',
+                             str(listener[constants.PROTOCOL]).lower())))
+            commands.extend(
+                self._refresh_lb_vips(
+                    ovn_lb, external_ids, is_sync=is_sync)
+            )
+            if commands:
+                self._execute_commands(commands)
         except Exception:
-            LOG.exception(ovn_const.EXCEPTION_MSG, "creation of listener")
+            LOG.exception(ovn_const.EXCEPTION_MSG,
+                          f"{ 'sync' if is_sync else 'creation' } of listener")
+            # We don't want to update status if we're syncing the listener
+            if is_sync:
+                return
             status = {
                 constants.LISTENERS: [
                     {constants.ID: listener[constants.ID],
@@ -1553,9 +1794,13 @@ class OvnProviderHelper():
                     lb_hc.external_ids.get(
                         ovn_const.LB_EXT_IDS_HM_POOL_KEY)):
                     if not self._update_lbhc_vip_port(
-                            lb_hc, listener[constants.PROTOCOL_PORT]):
+                        lb_hc, listener[constants.PROTOCOL_PORT],
+                        is_sync=is_sync
+                    ):
                         operating_status = constants.ERROR
-
+        # We don't want to update status if we're syncing the listener
+        if is_sync:
+            return
         status = {
             constants.LISTENERS: [
                 {constants.ID: listener[constants.ID],
@@ -1565,6 +1810,12 @@ class OvnProviderHelper():
                 {constants.ID: listener[constants.LOADBALANCER_ID],
                  constants.PROVISIONING_STATUS: constants.ACTIVE}]}
         return status
+
+    def listener_sync(self, listener):
+        return self._listener_create_or_sync(listener, is_sync=True)
+
+    def listener_create(self, listener):
+        return self._listener_create_or_sync(listener)
 
     def listener_delete(self, listener):
         status = {
@@ -1724,41 +1975,72 @@ class OvnProviderHelper():
         return status
 
     def pool_create(self, pool):
+        return self._pool_create_or_sync(pool)
+
+    def pool_sync(self, pool):
+        return self._pool_create_or_sync(pool, is_sync=True)
+
+    def _pool_create_or_sync(self, pool, is_sync=False):
         ovn_lb = self._get_or_create_ovn_lb(
             pool[constants.LOADBALANCER_ID],
             pool[constants.PROTOCOL],
             pool[constants.ADMIN_STATE_UP],
             lb_algorithm=pool[constants.LB_ALGORITHM])
-
+        ex_ids_changed = False
         external_ids = copy.deepcopy(ovn_lb.external_ids)
         pool_key = self._get_pool_key(
             pool[constants.ID], is_enabled=pool[constants.ADMIN_STATE_UP])
+        if pool_key not in ovn_lb.external_ids:
+            ex_ids_changed = True
         external_ids[pool_key] = ''
         if pool[constants.LISTENER_ID]:
             listener_key = self._get_listener_key(pool[constants.LISTENER_ID])
             if listener_key in ovn_lb.external_ids:
+                pool_key_enable = self._get_pool_key(
+                    pool[constants.ID], is_enabled=True)
+                pool_key_disable = self._get_pool_key(
+                    pool[constants.ID], is_enabled=False)
+
+                if pool[constants.ID] in external_ids[listener_key]:
+                    # Remove exist pool key before adding.
+                    external_ids[listener_key] = (
+                        external_ids[listener_key].replace(
+                            pool_key_disable, ''))
+                    external_ids[listener_key] = (
+                        external_ids[listener_key].replace(
+                            pool_key_enable, ''))
+
                 external_ids[listener_key] = str(
                     external_ids[listener_key]) + str(pool_key)
+                if ovn_lb.external_ids[listener_key] != external_ids[
+                        listener_key]:
+                    ex_ids_changed = True
         persistence_timeout = None
         if pool.get(constants.SESSION_PERSISTENCE):
             persistence_timeout = pool[constants.SESSION_PERSISTENCE].get(
                 constants.PERSISTENCE_TIMEOUT, '360')
         try:
             commands = []
-            commands.append(self.ovn_nbdb_api.db_set(
-                'Load_Balancer', ovn_lb.uuid,
-                ('external_ids', external_ids)))
+            if not is_sync or (
+                is_sync and ex_ids_changed
+            ):
+                commands.append(self.ovn_nbdb_api.db_set(
+                    'Load_Balancer', ovn_lb.uuid,
+                    ('external_ids', external_ids)))
 
             if persistence_timeout:
                 options = copy.deepcopy(ovn_lb.options)
                 options[ovn_const.AFFINITY_TIMEOUT] = str(persistence_timeout)
-
-                commands.append(self.ovn_nbdb_api.db_set(
-                    'Load_Balancer', ovn_lb.uuid,
-                    ('options', options)))
+                if not is_sync or (
+                    is_sync and ovn_lb.options != persistence_timeout
+                ):
+                    commands.append(self.ovn_nbdb_api.db_set(
+                        'Load_Balancer', ovn_lb.uuid,
+                        ('options', options)))
 
             self._execute_commands(commands)
-
+            if is_sync:
+                return
             # Pool status will be set to Online after a member is added to it
             # or when it is created with listener.
             operating_status = constants.OFFLINE
@@ -1779,7 +2061,11 @@ class OvnProviderHelper():
                      constants.PROVISIONING_STATUS: constants.ACTIVE}]
                 status[constants.LISTENERS] = listener_status
         except Exception:
-            LOG.exception(ovn_const.EXCEPTION_MSG, "creation of pool")
+            LOG.exception(
+                ovn_const.EXCEPTION_MSG,
+                f"{ 'sync' if is_sync else 'creation' } of pool")
+            if is_sync:
+                return
             status = {
                 constants.POOLS: [
                     {constants.ID: pool[constants.ID],
@@ -1992,7 +2278,7 @@ class OvnProviderHelper():
         return constants.NO_MONITOR
 
     def _update_member_statuses(self, ovn_lb, pool_id, provisioning_status,
-                                operating_status):
+                                operating_status, is_sync=False):
         member_statuses = []
         existing_members = ovn_lb.external_ids.get(
             ovn_const.LB_EXT_IDS_POOL_PREFIX + str(pool_id))
@@ -2005,11 +2291,11 @@ class OvnProviderHelper():
                 self._update_external_ids_member_status(
                     ovn_lb,
                     mem_info.split('_')[1],
-                    operating_status)
+                    operating_status, is_sync=is_sync)
         return member_statuses
 
     def _update_external_ids_member_status(self, ovn_lb, member, status=None,
-                                           delete=False):
+                                           delete=False, is_sync=False):
         existing_members = ovn_lb.external_ids.get(
             ovn_const.OVN_MEMBER_STATUS_KEY)
         try:
@@ -2023,6 +2309,8 @@ class OvnProviderHelper():
             if member in existing_members:
                 del existing_members[member]
         else:
+            if is_sync and member in existing_members:
+                return None
             existing_members[member] = status
 
         try:
@@ -2042,7 +2330,19 @@ class OvnProviderHelper():
                           " %s delete: %s status: %s", str(member),
                           str(delete), str(status))
 
-    def _add_member(self, member, ovn_lb, pool_key):
+    def _get_members_in_ovn_lb(self, ovn_lb, pool_key):
+        existing_members = ovn_lb.external_ids[pool_key]
+        if existing_members:
+            existing_members = existing_members.split(",")
+            return [
+                self._extract_member_info(
+                    member)[0] for member in existing_members
+            ]
+        else:
+            return []
+
+    def _add_member(self, member, ovn_lb, pool_key, is_sync=False):
+        skip_ext_set = False
         external_ids = copy.deepcopy(ovn_lb.external_ids)
         existing_members = external_ids[pool_key]
         if existing_members:
@@ -2050,32 +2350,43 @@ class OvnProviderHelper():
         member_info = self._get_member_info(member)
         if member_info in existing_members:
             # Member already present
-            return None
+            if not is_sync:
+                return None
+            else:
+                skip_ext_set = True
         if existing_members:
-            existing_members.append(member_info)
+            if not is_sync or (
+                is_sync and member_info not in existing_members
+            ):
+                existing_members.append(member_info)
             pool_data = {pool_key: ",".join(existing_members)}
         else:
             pool_data = {pool_key: member_info}
-
         commands = []
-        commands.append(
-            self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
-                                     ('external_ids', pool_data)))
+        if not skip_ext_set:
+            commands.append(
+                self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
+                                         ('external_ids', pool_data)))
 
         external_ids[pool_key] = pool_data[pool_key]
 
         # NOTE(froyo): Add the member to the vips if it is enabled
         if member.get(constants.ADMIN_STATE_UP, False):
-            commands.extend(self._refresh_lb_vips(ovn_lb, external_ids))
+            commands.extend(
+                self._refresh_lb_vips(
+                    ovn_lb, external_ids, is_sync=is_sync)
+            )
 
         # Note (froyo): commands are now splitted to separate atomic process,
         # leaving outside the not mandatory ones to allow add_member
         # finish correctly
-        self._execute_commands(commands)
+        if commands:
+            self._execute_commands(commands)
 
         subnet_id = member[constants.SUBNET_ID]
         self._update_lb_to_ls_association(
-            ovn_lb, subnet_id=subnet_id, associate=True, update_ls_ref=True)
+            ovn_lb, subnet_id=subnet_id, associate=True, update_ls_ref=True,
+            is_sync=is_sync)
 
         # Make sure that all logical switches related to logical router
         # are associated with the load balancer. This is needed to handle
@@ -2090,14 +2401,14 @@ class OvnProviderHelper():
                 check_error=True)
             ovn_lr = self._find_lr_of_ls(
                 ovn_ls, subnet.gateway_ip)
-        except openstack.exceptions.ResourceNotFound:
-            pass
-        except idlutils.RowNotFound:
+        except (idlutils.RowNotFound,
+                openstack.exceptions.ResourceNotFound):
             pass
 
         if ovn_lr:
             try:
-                self._update_lb_to_lr_association(ovn_lb, ovn_lr)
+                self._update_lb_to_lr_association(ovn_lb, ovn_lr,
+                                                  is_sync=is_sync)
             except idlutils.RowNotFound:
                 LOG.warning("The association of loadbalancer %s to the "
                             "logical router %s failed, trying step by step",
@@ -2106,16 +2417,22 @@ class OvnProviderHelper():
 
         return member_info
 
-    def member_create(self, member):
+    def _member_create_or_sync(self, member, is_sync=False):
         new_member = None
         try:
             pool_key, ovn_lb = self._find_ovn_lb_by_pool_id(
                 member[constants.POOL_ID])
-            new_member = self._add_member(member, ovn_lb, pool_key)
+            new_member = self._add_member(
+                member, ovn_lb, pool_key,
+                is_sync=is_sync)
+
             operating_status = constants.NO_MONITOR
         except Exception:
-            LOG.exception(ovn_const.EXCEPTION_MSG, "creation of member")
+            LOG.exception(ovn_const.EXCEPTION_MSG,
+                          f"{ 'sync' if is_sync else 'creation' } of member")
             operating_status = constants.ERROR
+            if is_sync:
+                return
         if not member[constants.ADMIN_STATE_UP]:
             operating_status = constants.OFFLINE
         elif (new_member and operating_status == constants.NO_MONITOR and
@@ -2123,7 +2440,8 @@ class OvnProviderHelper():
             operating_status = constants.ONLINE
             mb_ip, mb_port, mb_subnet, mb_id = self._extract_member_info(
                 new_member)[0]
-            mb_status = self._update_hm_member(ovn_lb, pool_key, mb_ip)
+            mb_status = self._update_hm_member(
+                ovn_lb, pool_key, mb_ip, is_sync=is_sync)
             operating_status = (
                 constants.ERROR
                 if mb_status != constants.ONLINE else mb_status
@@ -2132,10 +2450,19 @@ class OvnProviderHelper():
         self._update_external_ids_member_status(
             ovn_lb,
             member[constants.ID],
-            operating_status)
+            operating_status,
+            is_sync=is_sync)
 
+        if is_sync:
+            return
         status = self._get_current_operating_statuses(ovn_lb)
         return status
+
+    def member_sync(self, member):
+        return self._member_create_or_sync(member, is_sync=True)
+
+    def member_create(self, member):
+        return self._member_create_or_sync(member)
 
     def _remove_member(self, member, ovn_lb, pool_key):
         external_ids = copy.deepcopy(ovn_lb.external_ids)
@@ -2593,7 +2920,8 @@ class OvnProviderHelper():
                 # We found particular port
                 return port
 
-    def _add_lbhc(self, ovn_lb, pool_key, info):
+    def _add_lbhc(self, ovn_lb, pool_key, info, is_sync=False):
+        update_hm_status = False
         hm_id = info[constants.ID]
         status = {constants.ID: hm_id,
                   constants.PROVISIONING_STATUS: constants.ERROR,
@@ -2619,7 +2947,7 @@ class OvnProviderHelper():
         if not vips:
             LOG.error("Could not find VIP for HM %s, LB external_ids: %s",
                       hm_id, ovn_lb.external_ids)
-            return status
+            return status if not is_sync else None
         vip_port = self._get_pool_listener_port(ovn_lb, pool_key)
 
         # This is to enable lookups by Octavia DB ID value
@@ -2641,6 +2969,7 @@ class OvnProviderHelper():
         try:
             with self.ovn_nbdb_api.transaction(check_error=True) as txn:
                 for vip in vips:
+                    recreate = False
                     # Just seems like this needs ovsdbapp support, see:
                     #  ovsdbapp/schema/ovn_northbound/impl_idl.py
                     #      - lb_add()
@@ -2660,21 +2989,73 @@ class OvnProviderHelper():
                         ovn_const.LB_EXT_IDS_HMS_KEY, [])
                     if hms_key:
                         hms_key = jsonutils.loads(hms_key)
-                    health_check = txn.add(
-                        self.ovn_nbdb_api.db_create(
-                            'Load_Balancer_Health_Check',
-                            **kwargs))
-                    txn.add(self.ovn_nbdb_api.db_add(
-                        'Load_Balancer', ovn_lb.uuid,
-                        'health_check', health_check))
-                    hms_key.append(hm_id)
-                    txn.add(self.ovn_nbdb_api.db_set(
-                        'Load_Balancer', ovn_lb.uuid,
-                        ('external_ids', {ovn_const.LB_EXT_IDS_HMS_KEY:
-                            jsonutils.dumps(hms_key)})))
+                    if is_sync:
+                        lbhcs, _ = self._find_ovn_lb_from_hm_id(hm_id)
+                        if not lbhcs:
+                            recreate = True
+                        for lbhc in lbhcs:
+                            commands = []
+                            if lbhc.vip != kwargs.get('vip'):
+                                commands.append(
+                                    self.ovn_nbdb_api.db_set(
+                                        'Load_Balancer_Health_Check',
+                                        lbhc.uuid,
+                                        ('vip', kwargs.get('vip'))))
+                            if lbhc.options != options:
+                                commands.append(
+                                    self.ovn_nbdb_api.db_set(
+                                        'Load_Balancer_Health_Check',
+                                        lbhc.uuid,
+                                        ('options', options)))
+                            if lbhc.external_ids != external_ids_vip:
+                                commands.append(
+                                    self.ovn_nbdb_api.db_set(
+                                        'Load_Balancer_Health_Check',
+                                        lbhc.uuid,
+                                        ('external_ids', external_ids_vip)))
+
+                            found_in_exist = False
+                            for hc in ovn_lb.health_check:
+                                if str(hc.uuid) == str(lbhc.uuid):
+                                    found_in_exist = True
+                            if not found_in_exist:
+                                commands.append(
+                                    self.ovn_nbdb_api.db_add(
+                                        'Load_Balancer', ovn_lb.uuid,
+                                        ('health_check', lbhc.uuid)))
+                            if hm_id not in hms_key:
+                                hms_key.append(hm_id)
+                                commands.append(self.ovn_nbdb_api.db_set(
+                                    'Load_Balancer', ovn_lb.uuid,
+                                    ('external_ids',
+                                     {ovn_const.LB_EXT_IDS_HMS_KEY:
+                                      jsonutils.dumps(hms_key)})))
+                            self._execute_commands(commands)
+                    if not is_sync or recreate:
+                        health_check = txn.add(
+                            self.ovn_nbdb_api.db_create(
+                                'Load_Balancer_Health_Check',
+                                **kwargs))
+                        if recreate:
+                            txn.add(
+                                self.ovn_nbdb_api.db_set(
+                                    'Load_Balancer_Health_Check',
+                                    health_check,
+                                    ('vip', kwargs.get('vip'))))
+                        txn.add(self.ovn_nbdb_api.db_add(
+                            'Load_Balancer', ovn_lb.uuid,
+                            'health_check', health_check))
+                        update_hm_status = True
+                        if hm_id not in hms_key:
+                            hms_key.append(hm_id)
+                            txn.add(self.ovn_nbdb_api.db_set(
+                                'Load_Balancer', ovn_lb.uuid,
+                                ('external_ids', {ovn_const.LB_EXT_IDS_HMS_KEY:
+                                    jsonutils.dumps(hms_key)})))
                 if fips:
                     external_ids_fip = copy.deepcopy(external_ids)
                     for fip in fips:
+                        recreate = False
                         external_ids_fip[ovn_const.LB_EXT_IDS_HM_VIP] = fip
                         if netaddr.IPNetwork(
                                 fip).version == n_const.IP_VERSION_6:
@@ -2686,22 +3067,56 @@ class OvnProviderHelper():
                             'options': options,
                             'external_ids': external_ids_fip}
 
-                        fip_health_check = txn.add(
-                            self.ovn_nbdb_api.db_create(
-                                'Load_Balancer_Health_Check',
-                                **fip_kwargs))
-                        txn.add(self.ovn_nbdb_api.db_add(
-                            'Load_Balancer', ovn_lb.uuid,
-                            'health_check', fip_health_check))
+                        if is_sync:
+                            lbhcs, _ = self._find_ovn_lb_from_hm_id(hm_id)
+                            if not lbhcs:
+                                recreate = True
+                            for lbhc in lbhcs:
+                                commands = []
+                                if lbhc.vip != fip_kwargs['vip']:
+                                    commands.append(
+                                        self.ovn_nbdb_api.db_set(
+                                            'Load_Balancer_Health_Check',
+                                            lbhc.uuid,
+                                            ('vip', fip_kwargs['vip'])))
+                                if lbhc.options != options:
+                                    commands.append(
+                                        self.ovn_nbdb_api.db_set(
+                                            'Load_Balancer_Health_Check',
+                                            lbhc.uuid,
+                                            ('options', options)))
+                                if lbhc.external_ids != external_ids_vip:
+                                    commands.append(
+                                        self.ovn_nbdb_api.db_set(
+                                            'Load_Balancer_Health_Check',
+                                            lbhc.uuid,
+                                            ('external_ids', external_ids_fip
+                                             )))
+                                self._execute_commands(commands)
+                        if not is_sync or recreate:
+                            fip_health_check = txn.add(
+                                self.ovn_nbdb_api.db_create(
+                                    'Load_Balancer_Health_Check',
+                                    **fip_kwargs))
+                            if recreate:
+                                txn.add(
+                                    self.ovn_nbdb_api.db_set(
+                                        'Load_Balancer_Health_Check',
+                                        fip_health_check,
+                                        ('vip', fip_kwargs['vip'])))
+                            txn.add(self.ovn_nbdb_api.db_add(
+                                'Load_Balancer', ovn_lb.uuid,
+                                'health_check', fip_health_check))
                 status = {constants.ID: hm_id,
                           constants.PROVISIONING_STATUS: constants.ACTIVE,
                           constants.OPERATING_STATUS: operating_status}
         except Exception:
             # Any Exception will return ERROR status
             LOG.exception(ovn_const.EXCEPTION_MSG, "set of health check")
-        return status
+        if not is_sync or update_hm_status:
+            return status
 
-    def _update_lbhc_vip_port(self, lbhc, vip_port):
+    def _update_lbhc_vip_port(self, lbhc, vip_port, is_sync=False):
         if lbhc.vip:
             vip = lbhc.vip.rsplit(":")[0] + ':' + str(vip_port)
         else:
@@ -2713,15 +3128,20 @@ class OvnProviderHelper():
                     vip = f'[{vip}]'
                 vip = vip + ':' + str(vip_port)
         commands = []
-        commands.append(
-            self.ovn_nbdb_api.db_set(
-                'Load_Balancer_Health_Check', lbhc.uuid,
-                ('vip', vip)))
+        # Check if it's not sync case,
+        # or is sync and vip in lb health check not synced
+        if not is_sync or (
+            is_sync and (vip != lbhc.vip)
+        ):
+            commands.append(
+                self.ovn_nbdb_api.db_set(
+                    'Load_Balancer_Health_Check', lbhc.uuid,
+                    ('vip', vip)))
         self._execute_commands(commands)
         return True
 
     def _update_ip_port_mappings(self, ovn_lb, backend_ip, port_name, src_ip,
-                                 delete=False):
+                                 delete=False, is_sync=False):
 
         # ip_port_mappings:${MEMBER_IP}=${LSP_NAME_MEMBER}:${HEALTH_SRC}
         # where:
@@ -2736,7 +3156,8 @@ class OvnProviderHelper():
             self.ovn_nbdb_api.lb_add_ip_port_mapping(ovn_lb.uuid,
                                                      backend_ip,
                                                      port_name,
-                                                     src_ip).execute()
+                                                     src_ip,
+                                                     is_sync).execute()
 
     def _clean_ip_port_mappings(self, ovn_lb, pool_key=None):
         if not pool_key:
@@ -2779,7 +3200,8 @@ class OvnProviderHelper():
                     self.ovn_nbdb_api.lb_del_ip_port_mapping(
                         ovn_lb.uuid, mb_ip).execute()
 
-    def _update_hm_member(self, ovn_lb, pool_key, backend_ip, delete=False):
+    def _update_hm_member(self, ovn_lb, pool_key, backend_ip, delete=False,
+                          is_sync=False):
         # Update just the backend_ip member
         for mb_ip, mb_port, mb_subnet, mb_id in self._extract_member_info(
                 ovn_lb.external_ids[pool_key]):
@@ -2822,13 +3244,13 @@ class OvnProviderHelper():
                     return None
                 self._update_ip_port_mappings(ovn_lb, backend_ip,
                                               member_lsp.name, hm_source_ip,
-                                              delete)
+                                              delete, is_sync=is_sync)
                 return constants.ONLINE
 
         # NOTE(froyo): If the backend is not located
         return constants.ERROR
 
-    def _lookup_lbhcs_by_hm_id(self, hm_id):
+    def _lookup_lbhcs_by_hm_id(self, hm_id, raise_on_not_found=True):
         lbhc_rows = self.ovn_nbdb_api.db_list_rows(
             'Load_Balancer_Health_Check').execute(check_error=True)
         lbhcs = []
@@ -2837,6 +3259,8 @@ class OvnProviderHelper():
                     lbhc.external_ids[ovn_const.LB_EXT_IDS_HM_KEY] == hm_id):
                 lbhcs.append(lbhc)
         if lbhcs:
+            return lbhcs
+        if not raise_on_not_found:
             return lbhcs
         raise idlutils.RowNotFound(table='Load_Balancer_Health_Check',
                                    col='external_ids', match=hm_id)
@@ -2859,7 +3283,7 @@ class OvnProviderHelper():
 
         return lbhcs, ovn_lb
 
-    def hm_create(self, info):
+    def hm_create_ovn_lb(self, info):
         status = {
             constants.HEALTHMONITORS: [
                 {constants.ID: info[constants.ID],
@@ -2899,10 +3323,57 @@ class OvnProviderHelper():
                  constants.OPERATING_STATUS: constants.ONLINE})
 
         # Update status for all members in the pool
-        member_status = self._update_member_statuses(ovn_lb, pool_id,
-                                                     constants.ACTIVE,
-                                                     constants.ONLINE)
-        status[constants.MEMBERS] = member_status
+        self._update_member_statuses(ovn_lb, pool_id,
+                                     constants.ACTIVE,
+                                     constants.ONLINE)
+        return status
+
+    def _hm_create_or_sync(self, info, is_sync=False):
+        status = {
+            constants.HEALTHMONITORS: [
+                {constants.ID: info[constants.ID],
+                 constants.OPERATING_STATUS: constants.NO_MONITOR,
+                 constants.PROVISIONING_STATUS: constants.ERROR}]}
+
+        pool_id = info[constants.POOL_ID]
+        pool_key, ovn_lb = self._find_ovn_lb_by_pool_id(pool_id)
+        if not ovn_lb:
+            LOG.debug("Could not find LB with pool id %s", pool_id)
+            return None if is_sync else status
+
+        status[constants.LOADBALANCERS] = [
+            {constants.ID: ovn_lb.name,
+             constants.PROVISIONING_STATUS: constants.ACTIVE}]
+        if pool_key not in ovn_lb.external_ids:
+            # Returning early here will cause the pool to go into
+            # PENDING_UPDATE state, which is not good
+            LOG.error("Could not find pool with key %s, LB external_ids: %s",
+                      pool_key, ovn_lb.external_ids)
+            status[constants.POOLS] = [
+                {constants.ID: pool_id,
+                 constants.OPERATING_STATUS: constants.OFFLINE}]
+            return None if is_sync else status
+        status[constants.POOLS] = [
+            {constants.ID: pool_id,
+             constants.PROVISIONING_STATUS: constants.ACTIVE,
+             constants.OPERATING_STATUS: constants.ONLINE}]
+
+        pool_listeners = self._get_pool_listeners(ovn_lb, pool_key)
+
+        status[constants.LISTENERS] = []
+        for listener in pool_listeners:
+            status[constants.LISTENERS].append(
+                {constants.ID: listener,
+                 constants.PROVISIONING_STATUS: constants.ACTIVE,
+                 constants.OPERATING_STATUS: constants.ONLINE})
+
+        if not is_sync:
+            # Update status for all members in the pool
+            member_status = self._update_member_statuses(ovn_lb, pool_id,
+                                                         constants.ACTIVE,
+                                                         constants.ONLINE,
+                                                         is_sync=is_sync)
+            status[constants.MEMBERS] = member_status
 
         # MONITOR_PRT = 80
         # ovn-nbctl --wait=sb -- --id=@hc create Load_Balancer_Health_Check
@@ -2910,22 +3381,67 @@ class OvnProviderHelper():
         #   ${OVN_LB_ID} health_check @hc
         # options here are interval, timeout, failure_count and success_count
         # from info object passed-in
-        hm_status = self._add_lbhc(ovn_lb, pool_key, info)
+        hm_status = self._add_lbhc(ovn_lb, pool_key, info, is_sync=is_sync)
+        if is_sync and not hm_status:
+            return None
         if hm_status[constants.PROVISIONING_STATUS] == constants.ACTIVE:
             for mb_ip, mb_port, mb_subnet, mb_id in self._extract_member_info(
                     ovn_lb.external_ids[pool_key]):
-                mb_status = self._update_hm_member(ovn_lb, pool_key, mb_ip)
+                mb_status = self._update_hm_member(ovn_lb, pool_key, mb_ip,
+                                                   is_sync=is_sync)
                 if not mb_status:
                     hm_status[constants.PROVISIONING_STATUS] = constants.ERROR
                     hm_status[constants.OPERATING_STATUS] = constants.ERROR
                     self._clean_ip_port_mappings(ovn_lb, pool_key)
                     break
                 self._update_external_ids_member_status(
-                    ovn_lb, mb_id, mb_status)
+                    ovn_lb, mb_id, mb_status, is_sync=is_sync)
             else:
                 status = self._get_current_operating_statuses(ovn_lb)
         status[constants.HEALTHMONITORS] = [hm_status]
         return status
+
+    def hm_purge(self, lb_id):
+        # remove redundant hm if any, if no
+        # ovn_const.LB_EXT_IDS_HMS_KEY from lb matches,
+        # this hm has no used and should already got replaced.
+        ovn_lbs = []
+        try:
+            ovn_lbs = self._find_ovn_lbs_with_retry(lb_id)
+        except idlutils.RowNotFound:
+            LOG.debug(f"OVN loadbalancer {lb_id} not found.")
+        fetch_hc_ids = []
+        for ovn_lb in ovn_lbs:
+            hm_ids = ovn_lb.external_ids.get(
+                ovn_const.LB_EXT_IDS_HMS_KEY, [])
+            if hm_ids:
+                hm_ids = jsonutils.loads(hm_ids)
+            for hm_id in hm_ids:
+                lbhcs = self._lookup_lbhcs_by_hm_id(
+                    hm_id, raise_on_not_found=False)
+                fetch_hc_ids.extend([str(lbhc.uuid) for lbhc in lbhcs])
+
+            for hc_id in ovn_lb.health_check:
+                if str(hc_id.uuid) not in fetch_hc_ids:
+                    commands = []
+                    commands.append(
+                        self.ovn_nbdb_api.db_remove(
+                            'Load_Balancer', ovn_lb.uuid,
+                            'health_check', hc_id.uuid))
+                    commands.append(
+                        self.ovn_nbdb_api.db_destroy(
+                            'Load_Balancer_Health_Check',
+                            hc_id.uuid))
+                    try:
+                        self._execute_commands(commands)
+                    except idlutils.RowNotFound:
+                        LOG.debug("health check not found for purge.")
+
+    def hm_create(self, info):
+        return self._hm_create_or_sync(info)
+
+    def hm_sync(self, info):
+        return self._hm_create_or_sync(info, is_sync=True)
 
     def hm_update(self, info):
         status = {

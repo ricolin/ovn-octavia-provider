@@ -20,6 +20,7 @@ from octavia_lib.api.drivers import exceptions as driver_exceptions
 from octavia_lib.api.drivers import provider_base as driver_base
 from octavia_lib.common import constants
 from oslo_log import log as logging
+from ovsdbapp.backend.ovs_idl import idlutils
 
 from ovn_octavia_provider.common import config as ovn_conf
 # TODO(mjozefcz): Start consuming const and utils
@@ -88,7 +89,8 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                 user_fault_string=msg,
                 operator_fault_string=msg)
 
-    def loadbalancer_create(self, loadbalancer):
+    def _loadbalancer_create(self, loadbalancer,
+                             req_type=ovn_const.REQ_TYPE_LB_CREATE):
         admin_state_up = loadbalancer.admin_state_up
         if isinstance(admin_state_up, o_datamodels.UnsetType):
             admin_state_up = True
@@ -102,10 +104,12 @@ class OvnProviderDriver(driver_base.ProviderDriver):
             request_info[constants.ADDITIONAL_VIPS] = \
                 loadbalancer.additional_vips
 
-        request = {'type': ovn_const.REQ_TYPE_LB_CREATE,
+        request = {'type': req_type,
                    'info': request_info}
         self._ovn_helper.add_request(request)
 
+    def loadbalancer_create(self, loadbalancer):
+        self._loadbalancer_create(loadbalancer)
         if not isinstance(loadbalancer.listeners, o_datamodels.UnsetType):
             for listener in loadbalancer.listeners:
                 self.listener_create(listener)
@@ -141,7 +145,9 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         self._ovn_helper.add_request(request)
 
     # Pool
-    def pool_create(self, pool):
+    def _pool_create_or_sync(
+        self, pool, req_type=ovn_const.REQ_TYPE_POOL_CREATE
+    ):
         self._check_for_supported_protocols(pool.protocol)
         self._check_for_supported_algorithms(pool.lb_algorithm)
         admin_state_up = pool.admin_state_up
@@ -153,7 +159,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                         'lb_algorithm': pool.lb_algorithm,
                         'listener_id': pool.listener_id,
                         'admin_state_up': admin_state_up}
-        request = {'type': ovn_const.REQ_TYPE_POOL_CREATE,
+        request = {'type': req_type,
                    'info': request_info}
         if not isinstance(
                 pool.session_persistence, o_datamodels.UnsetType):
@@ -161,6 +167,12 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                 pool.session_persistence)
             request['info']['session_persistence'] = pool.session_persistence
         self._ovn_helper.add_request(request)
+
+    def _pool_sync(self, pool):
+        self._pool_create_or_sync(pool, req_type=ovn_const.REQ_TYPE_POOL_SYNC)
+
+    def pool_create(self, pool):
+        self._pool_create_or_sync(pool)
         if pool.healthmonitor is not None and not isinstance(
                 pool.healthmonitor, o_datamodels.UnsetType):
             self.health_monitor_create(pool.healthmonitor)
@@ -201,6 +213,16 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         self._ovn_helper.add_request(request)
 
     def listener_create(self, listener):
+        self._listener_create_or_sync(listener)
+
+    def _listener_sync(self, listener, is_sync=True):
+        self._listener_create_or_sync(
+            listener,
+            req_type=ovn_const.REQ_TYPE_LISTENER_SYNC)
+
+    def _listener_create_or_sync(
+            self, listener,
+            req_type=ovn_const.REQ_TYPE_LISTENER_CREATE):
         self._check_for_supported_protocols(listener.protocol)
         self._check_for_allowed_cidrs(listener.allowed_cidrs)
         admin_state_up = listener.admin_state_up
@@ -212,7 +234,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                         'protocol_port': listener.protocol_port,
                         'default_pool_id': listener.default_pool_id,
                         'admin_state_up': admin_state_up}
-        request = {'type': ovn_const.REQ_TYPE_LISTENER_CREATE,
+        request = {'type': req_type,
                    'info': request_info}
         self._ovn_helper.add_request(request)
 
@@ -282,11 +304,14 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         else:
             return vip_version != (netaddr.IPNetwork(member.address).version)
 
-    def member_create(self, member):
+    def _member_create_or_sync(
+        self, member, req_type=ovn_const.REQ_TYPE_MEMBER_CREATE
+    ):
         # Validate monitoring options if present
         self._check_member_monitor_options(member)
-        if self._ip_version_differs(member):
-            raise ovn_exc.IPVersionsMixingNotSupportedError()
+        if req_type == ovn_const.REQ_TYPE_MEMBER_CREATE:
+            if self._ip_version_differs(member):
+                raise ovn_exc.IPVersionsMixingNotSupportedError()
         admin_state_up = member.admin_state_up
         subnet_id = member.subnet_id
         if (isinstance(subnet_id, o_datamodels.UnsetType) or not subnet_id):
@@ -311,7 +336,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                         'pool_id': member.pool_id,
                         'subnet_id': subnet_id,
                         'admin_state_up': admin_state_up}
-        request = {'type': ovn_const.REQ_TYPE_MEMBER_CREATE,
+        request = {'type': req_type,
                    'info': request_info}
         self._ovn_helper.add_request(request)
 
@@ -326,6 +351,13 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         request = {'type': ovn_const.REQ_TYPE_HANDLE_MEMBER_DVR,
                    'info': request_info}
         self._ovn_helper.add_request(request)
+
+    def _member_sync(self, member):
+        return self._member_create_or_sync(
+            member, req_type=ovn_const.REQ_TYPE_MEMBER_SYNC)
+
+    def member_create(self, member):
+        return self._member_create_or_sync(member)
 
     def member_delete(self, member):
         # NOTE(froyo): OVN provider allow to create member without param
@@ -546,7 +578,9 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                     user_fault_string=msg,
                     operator_fault_string=msg)
 
-    def health_monitor_create(self, healthmonitor):
+    def _health_monitor_create_or_sync(
+        self, healthmonitor, req_type=ovn_const.REQ_TYPE_HM_CREATE
+    ):
         self._validate_hm_support(healthmonitor)
         admin_state_up = healthmonitor.admin_state_up
         if isinstance(admin_state_up, o_datamodels.UnsetType):
@@ -559,9 +593,16 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                         'failure_count': healthmonitor.max_retries_down,
                         'success_count': healthmonitor.max_retries,
                         'admin_state_up': admin_state_up}
-        request = {'type': ovn_const.REQ_TYPE_HM_CREATE,
+        request = {'type': req_type,
                    'info': request_info}
         self._ovn_helper.add_request(request)
+
+    def health_monitor_create(self, healthmonitor):
+        self._health_monitor_create_or_sync(healthmonitor)
+
+    def _health_monitor_sync(self, healthmonitor):
+        self._health_monitor_create_or_sync(
+            healthmonitor, req_type=ovn_const.REQ_TYPE_HM_SYNC)
 
     def health_monitor_update(self, old_healthmonitor, new_healthmonitor):
         self._validate_hm_support(new_healthmonitor, action='update')
@@ -585,3 +626,93 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         request = {'type': ovn_const.REQ_TYPE_HM_DELETE,
                    'info': request_info}
         self._ovn_helper.add_request(request)
+
+    def _loadbalancer_sync(self, loadbalancer):
+        try:
+            ovn_lbs = self._ovn_helper._find_ovn_lbs_with_retry(
+                loadbalancer.loadbalancer_id)
+        except idlutils.RowNotFound:
+            LOG.debug(f"OVN loadbalancer {loadbalancer.loadbalancer_id} "
+                      "not found. Start create process.")
+            self.loadbalancer_create(loadbalancer)
+            return
+        # Load Balancer
+        LOG.debug(f"Start sync loadbalancer {loadbalancer.loadbalancer_id}.")
+        self._loadbalancer_create(loadbalancer,
+                                  req_type=ovn_const.REQ_TYPE_LB_SYNC)
+        # Listener
+        if not isinstance(loadbalancer.listeners, o_datamodels.UnsetType):
+            for listener in loadbalancer.listeners:
+                self._listener_sync(listener)
+        # Pool
+        if not isinstance(loadbalancer.pools, o_datamodels.UnsetType):
+            for pool in loadbalancer.pools:
+                _, ovn_pool_lb = self._ovn_helper._find_ovn_lb_by_pool_id(
+                    pool.pool_id, ovn_lbs
+                )
+                if not ovn_pool_lb:
+                    LOG.debug(
+                        f"Start creating missing pool {pool.pool_id} "
+                        "in OVN.")
+                    self._pool_create_or_sync(pool)
+                else:
+                    self._pool_sync(pool)
+
+                # Member
+                ovn_pool_key, ovn_pool_lb = (
+                    self._ovn_helper._find_ovn_lb_by_pool_id_with_retry(
+                        pool.pool_id, ovn_lbs
+                    )
+                )
+                member_ids = []
+                for member in pool.members:
+                    if not member.subnet_id:
+                        member.subnet_id = loadbalancer.vip_subnet_id
+                    LOG.debug(
+                        "Start sync member "
+                        f"{member.member_id} from pool "
+                        f"{member.pool_id} in OVN."
+                    )
+                    self._member_sync(member)
+                    member_ids.append(member.member_id)
+
+                for ovn_member_info in self._ovn_helper._get_members_in_ovn_lb(
+                        ovn_pool_lb, ovn_pool_key
+                ):
+                    # If member ID not in pool member list, delete it.
+                    if ovn_member_info[3] not in member_ids:
+                        LOG.debug(
+                            "Start deleting extra member "
+                            f"{ovn_member_info[3]} from pool {pool.pool_id} "
+                            "in OVN."
+                        )
+                        request_info = {
+                            'id': ovn_member_info[3],
+                            'address': ovn_member_info[0],
+                            'pool_id': pool.pool_id,
+                            'subnet_id': ovn_member_info[2],
+                            'action': ovn_const.REQ_INFO_MEMBER_DELETED
+                        }
+                        request = {
+                            'type': ovn_const.REQ_TYPE_HANDLE_MEMBER_DVR,
+                            'info': request_info
+                        }
+                        self._ovn_helper.add_request(request)
+
+                # Check health monitor
+                if pool.healthmonitor is not None and not isinstance(
+                        pool.healthmonitor, o_datamodels.UnsetType):
+                    lbhcs, ovn_hm_lb = (
+                        self._ovn_helper._find_ovn_lb_from_hm_id(
+                            pool.healthmonitor.healthmonitor_id)
+                    )
+                    if not lbhcs and ovn_hm_lb is None:
+                        self.health_monitor_create(pool.healthmonitor)
+                    else:
+                        self._health_monitor_sync(pool.healthmonitor)
+        # Purge HM
+        self._ovn_helper.hm_purge(loadbalancer.loadbalancer_id)
+
+    def sync(self, loadbalancers):
+        for lb in loadbalancers:
+            self._loadbalancer_sync(lb)
