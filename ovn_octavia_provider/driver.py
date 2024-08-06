@@ -637,7 +637,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
             LOG.debug(f"OVN loadbalancer {loadbalancer.loadbalancer_id} "
                       "not found. Start create process.")
             self.loadbalancer_create(loadbalancer)
-            return
+            return False
         # Load Balancer
         LOG.debug(f"Start sync loadbalancer {loadbalancer.loadbalancer_id}.")
         self._loadbalancer_create(loadbalancer,
@@ -653,7 +653,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                     pool.pool_id, ovn_lbs
                 )
                 if not ovn_pool_lb:
-                    LOG.debug(
+                    LOG.info(
                         f"Start creating missing pool {pool.pool_id} "
                         "in OVN.")
                     self._pool_create_or_sync(pool)
@@ -683,7 +683,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                 ):
                     # If member ID not in pool member list, delete it.
                     if ovn_member_info[3] not in member_ids:
-                        LOG.debug(
+                        LOG.info(
                             "Start deleting extra member "
                             f"{ovn_member_info[3]} from pool {pool.pool_id} "
                             "in OVN."
@@ -714,6 +714,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                         self._health_monitor_sync(pool.healthmonitor)
         # Purge HM
         self._ovn_helper.hm_purge(loadbalancer.loadbalancer_id)
+        return True
 
     def _fip_sync(self, loadbalancer):
         LOG.info("Starting sync floating IP for Loadbalancer "
@@ -776,9 +777,53 @@ class OvnProviderDriver(driver_base.ProviderDriver):
                 return False
         return True
 
-    def sync(self, loadbalancers):
-        for lb in loadbalancers:
-            self._loadbalancer_sync(lb)
+    def sync(self, **lb_filters):
+        LOG.info(f"Starting sync OVN DB with Loadbalancer filter {lb_filters}")
+        octavia_client = clients.get_octavia_client()
+        recreated_lbs = []
+        # We can add project_id to lb_filters for lbs to limit the scope.
+        lbs = self._ovn_helper.get_octavia_lbs(octavia_client, **lb_filters)
+        for lb in lbs:
+            provider_lb = \
+                self._ovn_helper._octavia_driver_lib.get_loadbalancer(lb.id)
+            provider_pools = []
+            provider_listeners = []
+            pools = set() if provider_lb.pools is None else provider_lb.pools
+            for p in pools:
+                provider_pool = o_datamodels.Pool.from_dict(p)
+                # format healthmonitor provider
+                if not isinstance(
+                        provider_pool.healthmonitor, o_datamodels.UnsetType
+                ) and provider_pool.healthmonitor is not None:
+                    provider_pool.healthmonitor = \
+                        o_datamodels.HealthMonitor.from_dict(
+                            provider_pool.healthmonitor)
+                # format member provider
+                if not isinstance(
+                        provider_pool.members, o_datamodels.UnsetType
+                ) and provider_pool.members:
+                    provider_members = []
+                    for m in provider_pool.members:
+                        provider_members.append(
+                            o_datamodels.Member.from_dict(m))
+                    provider_pool.members = provider_members
+
+                provider_pools.append(provider_pool)
+            listeners = set() if provider_lb.listeners is None else \
+                provider_lb.listeners
+            for l in listeners:
+                provider_listeners.append(o_datamodels.Listener.from_dict(l))
+
+            provider_lb.pools = provider_pools
+            provider_lb.listeners = provider_listeners
+            LOG.info(f"Starting sync OVN DB with Loadbalancer {lb.id}")
+            synced = self._loadbalancer_sync(provider_lb)
+            if not synced:
+                recreated_lbs.append(provider_lb)
 
             # Sync floating ip for LB
-            self._fip_sync(lb)
+            self._fip_sync(provider_lb)
+
+        # Rerun sync on recreated lbs, make sure they're created correctly.
+        for lb in recreated_lbs:
+            self._loadbalancer_sync(lb)

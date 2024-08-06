@@ -15,6 +15,7 @@ import copy
 from unittest import mock
 
 from octavia_lib.api.drivers import data_models
+from octavia_lib.api.drivers import driver_lib as o_driver_lib
 from octavia_lib.api.drivers import exceptions
 from octavia_lib.common import constants
 import openstack
@@ -1873,3 +1874,38 @@ class TestOvnProviderDriver(ovn_base.TestOvnOctaviaBase):
                          'info': info}
         self.driver.health_monitor_delete(self.ref_health_monitor)
         self.mock_add_request.assert_called_once_with(expected_dict)
+
+    @mock.patch.object(ovn_driver.OvnProviderDriver, '_loadbalancer_sync')
+    @mock.patch.object(ovn_helper.OvnProviderHelper, 'get_octavia_lbs')
+    @mock.patch.object(clients, 'get_octavia_client')
+    def test_sync_no_lbs(self, oct_cli, m_golbs, m_lbsync):
+        m_golbs.return_value = []
+        self.driver.sync()
+        m_lbsync.assert_not_called()
+
+    @mock.patch.object(data_models.HealthMonitor, 'from_dict')
+    @mock.patch.object(data_models.Member, 'from_dict')
+    @mock.patch.object(data_models.Listener, 'from_dict')
+    @mock.patch.object(data_models.Pool, 'from_dict')
+    @mock.patch.object(o_driver_lib.DriverLibrary, 'get_loadbalancer')
+    @mock.patch.object(ovn_driver.OvnProviderDriver, '_loadbalancer_sync')
+    @mock.patch.object(ovn_helper.OvnProviderHelper, 'get_octavia_lbs')
+    @mock.patch.object(clients, 'get_octavia_client')
+    def test_sync(self, oct_cli, m_get_octavia_lbs, m_lbsync,
+                  m_get_loadbalancer, pool_from_dict, listener_from_dict,
+                  member_from_dict, hm_from_dict):
+        lb = mock.MagicMock(id=self.ref_lb_fully_sync_populated.name)
+        m_get_octavia_lbs.return_value = [lb]
+        pool_from_dict.return_value = self.ref_pool_with_hm
+        listener_from_dict.return_value = self.ref_listener
+        member_from_dict.return_value = self.ref_member
+        hm_from_dict.return_value = self.ref_health_monitor
+
+        m_get_loadbalancer.return_value = self.ref_lb_fully_sync_populated
+        self.driver.sync()
+        m_lbsync.assert_called_once_with(self.ref_lb_fully_sync_populated)
+        self.assertEqual(m_get_octavia_lbs.call_count, 1)
+        self.assertEqual(pool_from_dict.call_count, 1)
+        self.assertEqual(listener_from_dict.call_count, 1)
+        self.assertEqual(member_from_dict.call_count, 1)
+        self.assertEqual(hm_from_dict.call_count, 1)
