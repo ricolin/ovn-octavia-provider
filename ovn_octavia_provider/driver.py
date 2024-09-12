@@ -19,9 +19,11 @@ from octavia_lib.api.drivers import data_models as o_datamodels
 from octavia_lib.api.drivers import exceptions as driver_exceptions
 from octavia_lib.api.drivers import provider_base as driver_base
 from octavia_lib.common import constants
+import openstack
 from oslo_log import log as logging
 from ovsdbapp.backend.ovs_idl import idlutils
 
+from ovn_octavia_provider.common import clients
 from ovn_octavia_provider.common import config as ovn_conf
 # TODO(mjozefcz): Start consuming const and utils
 # from neutron-lib once released.
@@ -713,6 +715,70 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         # Purge HM
         self._ovn_helper.hm_purge(loadbalancer.loadbalancer_id)
 
+    def _fip_sync(self, loadbalancer):
+        LOG.info("Starting sync floating IP for Loadbalancer "
+                 f"{loadbalancer.loadbalancer_id}")
+        if not loadbalancer.vip_port_id or not loadbalancer.vip_network_id:
+            LOG.debug("VIP Port or Network not set for loadbalancer "
+                      f"{loadbalancer.loadbalancer_id}, skip FIP sync.")
+            return False
+
+        # Try to get FIP from neutron
+        neutron_client = clients.get_neutron_client()
+        try:
+            fips = list(neutron_client.ips(
+                port_id=loadbalancer.vip_port_id))
+        except openstack.exceptions.HttpException as e:
+            LOG.warn("Error on fetch fip for "
+                     f"{loadbalancer.loadbalancer_id}, skip FIP sync. "
+                     f"Error: {str(e)}")
+            return False
+        neutron_fip = fips[0].floating_ip_address if fips else None
+
+        # get fip from lsp
+        vip_lp = self._ovn_helper._get_lsp(
+            port_id=loadbalancer.vip_port_id,
+            network_id=loadbalancer.vip_network_id)
+        lsp_fip = vip_lp.external_ids.get(
+            ovn_const.OVN_PORT_FIP_EXT_ID_KEY) if vip_lp else None
+
+        if neutron_fip:
+            if not lsp_fip:
+                LOG.warn(
+                    "Logic Switch Port not found for port "
+                    f"{loadbalancer.vip_port_id}. "
+                    "Skip sync FIP for loadbalancer "
+                    f"{loadbalancer.loadbalancer_id}. Please "
+                    "run command `neutron-ovn-db-sync-util` "
+                    "first to sync OVN DB with Neutron DB.")
+                return False
+            if lsp_fip != neutron_fip:
+                LOG.warn(
+                    "Floating IP not consist between Logic Switch "
+                    f"Port and Neutron. Found FIP {lsp_fip} "
+                    f"in LSP {vip_lp.name}, but we have {neutron_fip} from "
+                    "Neutron. Skip sync FIP for "
+                    f"loadbalancer {loadbalancer.loadbalancer_id}. "
+                    "Please run command `neutron-ovn-db-sync-util` "
+                    "first to sync OVN DB with Neutron DB.")
+                return False
+            self._ovn_helper.vip_port_update_handler(
+                vip_lp=vip_lp, fip=lsp_fip,
+                action=ovn_const.REQ_INFO_ACTION_SYNC)
+        else:
+            if lsp_fip:
+                LOG.warn(
+                    "Floating IP not consist between Logic Switch "
+                    f"Port and Neutron. Found FIP {lsp_fip} configured "
+                    f"in LSP {vip_lp.name}, but no FIP configured from "
+                    "Neutron. Please run command `neutron-ovn-db-sync-util` "
+                    "first to sync OVN DB with Neutron DB.")
+                return False
+        return True
+
     def sync(self, loadbalancers):
         for lb in loadbalancers:
             self._loadbalancer_sync(lb)
+
+            # Sync floating ip for LB
+            self._fip_sync(lb)
