@@ -356,8 +356,11 @@ class OvnProviderHelper():
             if port:
                 request_info['vip_related'] = [
                     ip['ip_address'] for ip in port.fixed_ips]
-            self.add_request({'type': ovn_const.REQ_TYPE_HANDLE_VIP_FIP,
-                              'info': request_info})
+            if action != ovn_const.REQ_INFO_ACTION_SYNC:
+                self.add_request({'type': ovn_const.REQ_TYPE_HANDLE_VIP_FIP,
+                                  'info': request_info})
+            else:
+                self.handle_vip_fip(request_info)
 
     def _find_lb_in_ls(self, network):
         """Find LB associated to a Network using Network information
@@ -2967,8 +2970,13 @@ class OvnProviderHelper():
         additional_vip_fip = fip_info.get('additional_vip_fip', False)
         external_ids = copy.deepcopy(ovn_lb.external_ids)
         commands = []
+        need_ext_set = True
+        need_hc_set = True
 
-        if fip_info['action'] == ovn_const.REQ_INFO_ACTION_ASSOCIATE:
+        if fip_info['action'] in (
+            ovn_const.REQ_INFO_ACTION_ASSOCIATE,
+            ovn_const.REQ_INFO_ACTION_SYNC
+        ):
             if additional_vip_fip:
                 existing_addi_vip_fip = external_ids.get(
                     ovn_const.LB_EXT_IDS_ADDIT_VIP_FIP_KEY, [])
@@ -2985,31 +2993,51 @@ class OvnProviderHelper():
                     fip_info['vip_fip'])
                 vip_fip_info = {
                     ovn_const.LB_EXT_IDS_VIP_FIP_KEY: fip_info['vip_fip']}
-            commands.append(
-                self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
-                                         ('external_ids', vip_fip_info)))
-            for lb_hc in ovn_lb.health_check:
-                if self._get_vip_lbhc(lb_hc) in fip_info['vip_related']:
-                    vip = fip_info['vip_fip']
-                    lb_hc_external_ids = copy.deepcopy(lb_hc.external_ids)
-                    lb_hc_external_ids[ovn_const.LB_EXT_IDS_HM_VIP] = vip
-                    if self._check_lbhc_vip_format(lb_hc.vip):
-                        port = lb_hc.vip.rsplit(':')[-1]
-                        vip += ':' + port
-                    else:
-                        vip = ''
-                    kwargs = {
-                        'vip': vip,
-                        'options': lb_hc.options,
-                        'external_ids': lb_hc_external_ids}
-                    with self.ovn_nbdb_api.transaction(
-                            check_error=True) as txn:
-                        fip_lbhc = txn.add(self.ovn_nbdb_api.db_create(
-                            'Load_Balancer_Health_Check', **kwargs))
-                        txn.add(self.ovn_nbdb_api.db_add(
-                            'Load_Balancer', ovn_lb.uuid,
-                            'health_check', fip_lbhc))
+            if fip_info['action'] == ovn_const.REQ_INFO_ACTION_SYNC:
+                # Don't need to trigger OVN DB set if external_ids not changed
+                need_ext_set = not all(
+                    ovn_lb.external_ids.get(k) ==
+                    v for k, v in vip_fip_info.items()
+                )
+                # For sync scenario, check if FIP VIP already in health_check
+                for lb_hc in ovn_lb.health_check:
+                    # All lbhc in health_check are already checked
+                    # at this stage of sync workflow in hm_purge.
+                    # So we should be able to just check health_check.
+                    if self._get_vip_lbhc(lb_hc) == fip_info['vip_fip']:
+                        need_hc_set = False
+                        break
+
+            if need_ext_set:
+                commands.append(
+                    self.ovn_nbdb_api.db_set(
+                        'Load_Balancer', ovn_lb.uuid, (
+                            'external_ids', vip_fip_info)))
+
+            if need_hc_set:
+                for lb_hc in ovn_lb.health_check:
+                    if self._get_vip_lbhc(lb_hc) in fip_info['vip_related']:
+                        vip = fip_info['vip_fip']
+                        lb_hc_external_ids = copy.deepcopy(lb_hc.external_ids)
+                        lb_hc_external_ids[ovn_const.LB_EXT_IDS_HM_VIP] = vip
+                        if self._check_lbhc_vip_format(lb_hc.vip):
+                            port = lb_hc.vip.rsplit(':')[-1]
+                            vip += ':' + port
+                        else:
+                            vip = ''
+                        kwargs = {
+                            'vip': vip,
+                            'options': lb_hc.options,
+                            'external_ids': lb_hc_external_ids}
+                        with self.ovn_nbdb_api.transaction(
+                                check_error=True) as txn:
+                            fip_lbhc = txn.add(self.ovn_nbdb_api.db_create(
+                                'Load_Balancer_Health_Check', **kwargs))
+                            txn.add(self.ovn_nbdb_api.db_add(
+                                'Load_Balancer', ovn_lb.uuid,
+                                'health_check', fip_lbhc))
         else:
+            # For disassociate case
             existing_addi_vip_fip_need_updated = False
             existing_addi_vip_fip = external_ids.get(
                 ovn_const.LB_EXT_IDS_ADDIT_VIP_FIP_KEY, [])
@@ -3053,8 +3081,14 @@ class OvnProviderHelper():
                     commands.append(self.ovn_nbdb_api.db_destroy(
                         'Load_Balancer_Health_Check', lb_hc.uuid))
                     break
-
-        commands.extend(self._refresh_lb_vips(ovn_lb, external_ids))
+        commands.extend(
+            self._refresh_lb_vips(
+                ovn_lb,
+                external_ids,
+                is_sync=(
+                    fip_info['action'] == ovn_const.REQ_INFO_ACTION_SYNC)
+            )
+        )
         self._execute_commands(commands)
 
     def handle_member_dvr(self, info):
@@ -3141,6 +3175,18 @@ class OvnProviderHelper():
                             {'member': info['id'],
                              'fip': fip.external_ip})
 
+    def get_lsp(self, port_id, network_id):
+        ls_name = utils.ovn_name(network_id)
+        try:
+            ls = self.ovn_nbdb_api.lookup('Logical_Switch', ls_name)
+        except idlutils.RowNotFound:
+            LOG.warn(f"Logical Switch {ls_name} not found.")
+            return
+        for port in ls.ports:
+            if port_id in port.name:
+                # We found particular port
+                return port
+
     def _get_member_lsp(self, member_ip, member_subnet_id):
         neutron_client = clients.get_neutron_client()
         try:
@@ -3160,6 +3206,15 @@ class OvnProviderHelper():
             if member_ip in f(port.addresses):
                 # We found particular port
                 return port
+
+    def get_fip_from_vip(self, lb):
+        neutron_client = clients.get_neutron_client()
+        try:
+            return list(neutron_client.ips(port_id=lb.vip_port_id))
+        except openstack.exceptions.HttpException as e:
+            LOG.warn("Error on fetch fip for "
+                     f"{lb.loadbalancer_id} "
+                     f"Error: {str(e)}")
 
     def _add_lbhc(self, ovn_lb, pool_key, info):
         hm_id = info[constants.ID]
@@ -3587,7 +3642,7 @@ class OvnProviderHelper():
         raise idlutils.RowNotFound(table='Load_Balancer_Health_Check',
                                    col='external_ids', match=hm_id)
 
-    def _find_ovn_lb_from_hm_id(self, hm_id):
+    def _find_ovn_lb_from_hm_id(self, hm_id, lbhc_vip=None):
         lbs = self.ovn_nbdb_api.db_list_rows(
             'Load_Balancer').execute(check_error=True)
         ovn_lb = None
@@ -3598,7 +3653,14 @@ class OvnProviderHelper():
                 break
 
         try:
-            lbhcs = self._lookup_lbhcs_by_hm_id(hm_id)
+            lbhcs_by_hm_id = self._lookup_lbhcs_by_hm_id(hm_id)
+            if lbhc_vip:
+                lbhcs = []
+                for lbhc in lbhcs_by_hm_id:
+                    if lbhc.vip == lbhc_vip:
+                        lbhcs.append(lbhc)
+            else:
+                lbhcs = lbhcs_by_hm_id
         except idlutils.RowNotFound:
             LOG.debug("Loadbalancer health check %s not found!", hm_id)
             return [], ovn_lb
@@ -4113,17 +4175,17 @@ class OvnProviderHelper():
                     continue
                 fetch_hc_ids.extend([str(lbhc.uuid) for lbhc in lbhcs])
 
-            for hc_id in ovn_lb.health_check:
-                if str(hc_id.uuid) not in fetch_hc_ids:
+            for lbhc in ovn_lb.health_check:
+                if str(lbhc.uuid) not in fetch_hc_ids:
                     commands = []
                     commands.append(
                         self.ovn_nbdb_api.db_remove(
                             'Load_Balancer', ovn_lb.uuid,
-                            'health_check', hc_id.uuid))
+                            'health_check', lbhc.uuid))
                     commands.append(
                         self.ovn_nbdb_api.db_destroy(
                             'Load_Balancer_Health_Check',
-                            hc_id.uuid))
+                            lbhc.uuid))
                     try:
                         self._execute_commands(commands)
                     except idlutils.RowNotFound:
