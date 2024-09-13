@@ -134,10 +134,11 @@ class DelBackendFromIPPortMapping(command.BaseCommand):
 class AddBackendToIPPortMapping(command.BaseCommand):
     table = 'Load_Balancer'
 
-    def __init__(self, api, lb, backend_ip, port_name, src_ip):
+    def __init__(self, api, lb, backend_ip, port_name, src_ip, is_sync=False):
         super().__init__(api)
         self.lb = lb
         self.backend_ip = backend_ip
+        self.is_sync = is_sync
         self.port_name = port_name
         self.src_ip = src_ip
         if netaddr.IPNetwork(backend_ip).version == n_const.IP_VERSION_6:
@@ -147,11 +148,25 @@ class AddBackendToIPPortMapping(command.BaseCommand):
     def run_idl(self, txn):
         try:
             lb = self.api.lookup(self.table, self.lb)
-            lb.setkey('ip_port_mappings', self.backend_ip,
-                      '%s:%s' % (self.port_name, self.src_ip))
+            ip_port_mappings_needs_sync = False
+            if self.is_sync:
+                # Check if ip_port_mappings is properly seted
+                if not ((self.backend_ip in lb.ip_port_mappings) and
+                        (str(lb.ip_port_mappings.get(self.backend_ip)) ==
+                         f"{self.port_name}:{self.src_ip}")):
+                    ip_port_mappings_needs_sync = True
+            if not self.is_sync or ip_port_mappings_needs_sync:
+                lb.setkey('ip_port_mappings', self.backend_ip,
+                          f"{self.port_name}:{self.src_ip}")
+            else:
+                LOG.debug("Skip add IP port mappings for lb uuid "
+                          f"{str(lb.uuid)} as there is no different "
+                          "and no need to add under sync scenario.")
         except Exception:
-            LOG.exception("Error adding backend %s to ip_port_mappings "
-                          "for LB uuid %s", str(self.backend_ip), str(self.lb))
+            LOG.exception(
+                f"Error { 'syncing' if self.is_sync else 'adding' } backend "
+                f"{str(self.backend_ip)} to ip_port_mappings "
+                f"for LB uuid {str(self.lb.uuid)}")
 
 
 class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
@@ -194,9 +209,10 @@ class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
         return DelBackendFromIPPortMapping(self, lb_uuid, backend_ip)
 
     # NOTE(froyo): remove this method once ovsdbapp manages the IPv6 into [ ]
-    def lb_add_ip_port_mapping(self, lb_uuid, backend_ip, port_name, src_ip):
+    def lb_add_ip_port_mapping(self, lb_uuid, backend_ip, port_name, src_ip,
+                               is_sync=False):
         return AddBackendToIPPortMapping(self, lb_uuid, backend_ip, port_name,
-                                         src_ip)
+                                         src_ip, is_sync=is_sync)
 
 
 class OvsdbSbOvnIdl(sb_impl_idl.OvnSbApiIdlImpl, Backend):
