@@ -676,14 +676,14 @@ class OvnProviderDriver(driver_base.ProviderDriver):
         # Try to get FIP from neutron
         neutron_client = clients.get_neutron_client()
         try:
-            fips = list(neutron_client.ips(
-                port_id=loadbalancer.vip_port_id))
+            fips = neutron_client.list_floatingips(
+                port_id=loadbalancer.vip_port_id)['floatingips']
         except openstack.exceptions.HttpException as e:
             LOG.warn("Error on fetch fip for "
                      f"{loadbalancer.loadbalancer_id}, skip FIP sync. "
                      f"Error: {str(e)}")
             return False
-        neutron_fip = fips[0].floating_ip_address if fips else None
+        neutron_fip = fips[0].get('floating_ip_address') if fips else None
 
         # get fip from lsp
         vip_lp = self._ovn_helper._get_lsp(

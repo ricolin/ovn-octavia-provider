@@ -2498,6 +2498,17 @@ class OvnProviderHelper():
                 return True
         return False
 
+    def _get_vip_lbhc(self, lbhc):
+      vip = lbhc.external_ids.get(ovn_const.LB_EXT_IDS_HM_VIP, '')
+      if vip:
+          return vip
+      else:
+          if lbhc.vip:
+              ip_port = lbhc.vip.rsplit(':', 1)
+              if len(ip_port) == 2:
+                  return ip_port[0]
+      return ''
+
     def handle_vip_fip(self, fip_info):
         ovn_lb = fip_info['ovn_lb']
         external_ids = copy.deepcopy(ovn_lb.external_ids)

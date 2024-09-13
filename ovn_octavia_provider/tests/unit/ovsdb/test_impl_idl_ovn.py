@@ -15,6 +15,7 @@
 import os
 from unittest import mock
 
+from netaddr import core as net_core
 from neutron.tests import base
 from ovs.db import idl as ovs_idl
 from ovsdbapp.backend import ovs_idl as real_ovs_idl
@@ -116,3 +117,109 @@ class TestOvnSbIdlForLb(base.BaseTestCase):
                                'set_lock') as set_lock:
             self.idl = impl_idl_ovn.OvnSbIdlForLb(event_lock_name='foo')
         set_lock.assert_called_once_with('foo')
+
+
+class TestAddBackendToIPPortMapping(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        ovn_config.register_opts()
+        self.mock_gsh = mock.patch.object(
+            idlutils, 'get_schema_helper',
+            side_effect=lambda x, y: ovs_idl.SchemaHelper(
+                location=schema_files['OVN_Northbound'])).start()
+        self.backend_ip = '1.2.3.4'
+        self.backend_ip_ipv6 = 'e80::4868:1b06:5551:f707'
+        self.lb_uuid = 'lb_uuid'
+        self.port_name = 'port_name'
+        self.src_ip = '1.2.3.5'
+        self.src_ip_ipv6 = 'e80::4868:1b06:5552:f707'
+        self.idl = impl_idl_ovn.OvnNbIdlForLb()
+
+    def test_mapping_error_ip(self):
+        lb = mock.MagicMock()
+        lb.ip_port_mappings = {}
+        self.assertRaises(
+            net_core.AddrFormatError, impl_idl_ovn.AddBackendToIPPortMapping,
+            self.idl, self.lb_uuid, backend_ip='wrong_ip_format',
+            port_name=self.port_name, src_ip='wrong_ip_format',
+            is_sync=False)
+
+    def test_mapping(self):
+        lb = mock.MagicMock()
+        lb.ip_port_mappings = {}
+        pm = impl_idl_ovn.AddBackendToIPPortMapping(
+            self.idl, self.lb_uuid, backend_ip=self.backend_ip,
+            port_name=self.port_name, src_ip=self.src_ip,
+            is_sync=False)
+        pm.api = mock.MagicMock()
+        pm.api.lookup.return_value = lb
+        pm.run_idl(mock.Mock())
+        pm.api.lookup.assert_called_once_with('Load_Balancer', self.lb_uuid)
+        lb.setkey.assert_called_once_with(
+            'ip_port_mappings', self.backend_ip,
+            f'{self.port_name}:{self.src_ip}')
+
+    def test_mapping_ipv6(self):
+        lb = mock.MagicMock()
+        lb.ip_port_mappings = {}
+        pm = impl_idl_ovn.AddBackendToIPPortMapping(
+            self.idl, self.lb_uuid, backend_ip=self.backend_ip_ipv6,
+            port_name=self.port_name, src_ip=self.src_ip_ipv6,
+            is_sync=False)
+        pm.api = mock.MagicMock()
+        pm.api.lookup.return_value = lb
+        pm.run_idl(mock.Mock())
+        pm.api.lookup.assert_called_once_with('Load_Balancer', self.lb_uuid)
+        lb.setkey.assert_called_once_with(
+            'ip_port_mappings', f'[{self.backend_ip_ipv6}]',
+            f'{self.port_name}:[{self.src_ip_ipv6}]')
+
+    def test_mapping_is_sync_exist(self):
+        lb = mock.MagicMock()
+        lb.ip_port_mappings = {}
+        lb.ip_port_mappings[self.backend_ip] = (
+            f"{self.port_name}:{self.src_ip}")
+        pm = impl_idl_ovn.AddBackendToIPPortMapping(
+            self.idl, self.lb_uuid, backend_ip=self.backend_ip,
+            port_name=self.port_name, src_ip=self.src_ip,
+            is_sync=True)
+        pm.api = mock.MagicMock()
+        pm.api.lookup.return_value = lb
+        pm.run_idl(mock.Mock())
+        pm.api.lookup.assert_called_once_with('Load_Balancer', self.lb_uuid)
+        lb.setkey.assert_not_called()
+
+    def test_mapping_exception(self):
+        ovn_lb = mock.MagicMock(uuid='foo')
+        lb = mock.MagicMock()
+        lb.ip_port_mappings = {}
+        lb.ip_port_mappings[self.backend_ip] = (
+            f"{self.port_name}:{self.src_ip}")
+        pm = impl_idl_ovn.AddBackendToIPPortMapping(
+            self.idl, ovn_lb, backend_ip=self.backend_ip,
+            port_name=self.port_name, src_ip=self.src_ip,
+            is_sync=False)
+        pm.api = mock.MagicMock()
+        pm.api.lookup.side_effect = [OSError]
+        with mock.patch.object(impl_idl_ovn, 'LOG') as m_l:
+            pm.run_idl(mock.Mock())
+            m_l.exception.assert_called_once_with(
+                f"Error adding backend {self.backend_ip} "
+                f"to ip_port_mappings for LB uuid {ovn_lb.uuid}")
+        lb.setkey.assert_not_called()
+
+    def test_mapping_is_sync_not_exist(self):
+        lb = mock.MagicMock()
+        lb.ip_port_mappings = {}
+        pm = impl_idl_ovn.AddBackendToIPPortMapping(
+            self.idl, self.lb_uuid, backend_ip=self.backend_ip,
+            port_name=self.port_name, src_ip=self.src_ip,
+            is_sync=True)
+        pm.api = mock.MagicMock()
+        pm.api.lookup.return_value = lb
+        pm.run_idl(mock.Mock())
+        pm.api.lookup.assert_called_once_with('Load_Balancer', self.lb_uuid)
+        lb.setkey.assert_called_once_with(
+            'ip_port_mappings', self.backend_ip,
+            f'{self.port_name}:{self.src_ip}')
