@@ -1,0 +1,207 @@
+From f6b74aeb0aeb36d1aec937ddb89c51f5110cab4f Mon Sep 17 00:00:00 2001
+From: ricolin <rlin@vexxhost.com>
+Date: Mon, 24 Mar 2025 16:35:56 +0800
+Subject: [PATCH 5/9] Add Pool sync logic
+
+This patch adds the logic to sync a Pool entity from
+the Octavia database, correcting any discrepancies in fields or
+creating it if it does not exist in the OVN LB related on
+OVN Northbound (NB) database.
+
+Future patches will incrementally add support for syncing the
+remaining entities.
+
+Related-Bug: #2045415
+
+Co-authored-by: Fernando Royo <froyo@redhat.com>
+Co-authored-by: Rico Lin <ricolin@ricolky.com>
+Change-Id: I7293f4d29683d143fdc4ad6778d090a476c36e7c
+---
+ ovn_octavia_provider/driver.py | 38 +++++++++++++++
+ ovn_octavia_provider/helper.py | 88 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/ovn_octavia_provider/driver.py b/ovn_octavia_provider/driver.py
+index a18fad1..3118331 100644
+--- a/ovn_octavia_provider/driver.py
++++ b/ovn_octavia_provider/driver.py
+@@ -104,6 +104,26 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                         'admin_state_up': admin_state_up}
+         return request_info
+ 
++    def _get_pool_request_info(self, pool):
++        self._check_for_supported_protocols(pool.protocol)
++        self._check_for_supported_algorithms(pool.lb_algorithm)
++        admin_state_up = pool.admin_state_up
++        if isinstance(admin_state_up, o_datamodels.UnsetType):
++            admin_state_up = True
++        request_info = {'id': pool.pool_id,
++                        'loadbalancer_id': pool.loadbalancer_id,
++                        'protocol': pool.protocol,
++                        'lb_algorithm': pool.lb_algorithm,
++                        'listener_id': pool.listener_id,
++                        'admin_state_up': admin_state_up}
++        if not isinstance(
++                pool.session_persistence, o_datamodels.UnsetType):
++            self._check_for_supported_session_persistence(
++                pool.session_persistence)
++            request_info['session_persistence'] = pool.session_persistence
++
++        return request_info
++
+     def loadbalancer_create(self, loadbalancer):
+         request = {'type': ovn_const.REQ_TYPE_LB_CREATE,
+                    'info': self._get_loadbalancer_request_info(
+@@ -570,6 +590,12 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                     status_listener = self._ovn_helper.listener_create(
+                         self._get_listener_request_info(listener))
+                     status[constants.LISTENERS].append(status_listener)
++            if not isinstance(loadbalancer.pools, o_datamodels.UnsetType):
++                status[constants.POOLS] = []
++                for pool in loadbalancer.pools:
++                    status_pool = self._ovn_helper.pool_create(
++                        self._get_pool_request_info(pool))
++                    status[constants.POOLS].append(status_pool)
+             self._ovn_helper._update_status_to_octavia(status)
+         else:
+             # Load Balancer found, check LB and listener/pool/member/hms
+@@ -586,6 +612,11 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                     for listener in loadbalancer.listeners:
+                         self._ovn_helper.listener_sync(
+                             self._get_listener_request_info(listener), ovn_lb)
++                # Pool
++                if not isinstance(loadbalancer.pools, o_datamodels.UnsetType):
++                    for pool in loadbalancer.pools:
++                        self._ovn_helper.pool_sync(
++                            self._get_pool_request_info(pool), ovn_lb)
+                 status = self._ovn_helper._get_current_operating_statuses(
+                     ovn_lb)
+                 self._ovn_helper._update_status_to_octavia(status)
+@@ -607,4 +638,11 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                 o_datamodels.Listener.from_dict(listener)
+                 for listener in listeners
+             ] if listeners else o_datamodels.Unset
++
++            pools = provider_lb.pools or []
++            provider_lb.pools = [
++                o_datamodels.Pool.from_dict(pool)
++                for pool in pools
++            ] if pools else o_datamodels.Unset
++
+             self._ensure_loadbalancer(provider_lb)
+diff --git a/ovn_octavia_provider/helper.py b/ovn_octavia_provider/helper.py
+index f73dd1f..0545e79 100644
+--- a/ovn_octavia_provider/helper.py
++++ b/ovn_octavia_provider/helper.py
+@@ -643,6 +643,65 @@ class OvnProviderHelper():
+                 )
+             )
+ 
++    def _prepare_external_ids(self, pool, ovn_lb):
++        """Prepare the updated external_ids for the LoadBalancer."""
++        external_ids = copy.deepcopy(ovn_lb.external_ids)
++        pool_key = self._get_pool_key(
++            pool[constants.ID],
++            is_enabled=pool[constants.ADMIN_STATE_UP])
++        external_ids[pool_key] = ''
++
++        if pool[constants.LISTENER_ID]:
++            self._update_listener_association(
++                pool, ovn_lb, external_ids, pool_key)
++
++        return external_ids
++
++    def _update_listener_association(self, pool, ovn_lb, external_ids,
++                                     pool_key):
++        """Update the listener association in external_ids."""
++        listener_key = self._get_listener_key(pool[constants.LISTENER_ID])
++        if listener_key in ovn_lb.external_ids:
++            pool_key_enable = self._get_pool_key(pool[constants.ID],
++                                                 is_enabled=True)
++            pool_key_disable = self._get_pool_key(pool[constants.ID],
++                                                  is_enabled=False)
++
++            if pool[constants.ID] in external_ids[listener_key]:
++                # Remove existing pool keys before adding the updated key
++                external_ids[listener_key] = (
++                    external_ids[listener_key]
++                    .replace(pool_key_disable, '')
++                    .replace(pool_key_enable, '')
++                )
++
++            external_ids[listener_key] += str(pool_key)
++
++    def _extract_persistence_timeout(self, pool):
++        """Extract persistence timeout value from the pool, if available."""
++        if pool.get(constants.SESSION_PERSISTENCE):
++            return pool[constants.SESSION_PERSISTENCE].get(
++                constants.PERSISTENCE_TIMEOUT, '360')
++        return None
++
++    def _add_external_ids_command(self, commands, ovn_lb, external_ids):
++        """Add a command to update the external_ids of the LoadBalancer."""
++        commands.append(
++            self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
++                                     ('external_ids', external_ids))
++        )
++
++    def _add_persistence_timeout_command(self, commands, ovn_lb,
++                                         persistence_timeout):
++        """Add command to update persistence timeout in LoadBalancer."""
++        options = copy.deepcopy(ovn_lb.options)
++        options[ovn_const.AFFINITY_TIMEOUT] = str(persistence_timeout)
++        if ovn_lb.options != options:
++            commands.append(
++                self.ovn_nbdb_api.db_set('Load_Balancer', ovn_lb.uuid,
++                                         ('options', options))
++            )
++
+     def _lb_status(self, loadbalancer, provisioning_status, operating_status):
+         """Return status for the LoadBalancer."""
+         return {
+@@ -2000,7 +2059,11 @@ class OvnProviderHelper():
+         external_ids[pool_key] = ''
+         if pool[constants.LISTENER_ID]:
+             listener_key = self._get_listener_key(pool[constants.LISTENER_ID])
+-            if listener_key in ovn_lb.external_ids:
++            # NOTE(froyo): checking is not already when ovn-db-sync-tool is
++            # triggered, because listener_create could be added already if
++            # pool is considered as default one
++            if listener_key in ovn_lb.external_ids and \
++                    str(pool_key) not in external_ids[listener_key]:
+                 external_ids[listener_key] = str(
+                     external_ids[listener_key]) + str(pool_key)
+         try:
+@@ -2044,6 +2107,29 @@ class OvnProviderHelper():
+ 
+         return status
+ 
++    def pool_sync(self, pool, ovn_lb):
++        """Sync Pool object with an OVN LoadBalancer
++
++        The method performs the following steps:
++        1. Update pool key on OVN Loadbalancer external_ids if needed
++        2. Update OVN LoadBalancer options from Pool info
++
++        :param pool: The source pool object from Octavia DB
++        :param ovn_lb: The OVN LoadBalancer object that needs to be sync
++        """
++        external_ids = self._prepare_external_ids(pool, ovn_lb)
++        persistence_timeout = self._extract_persistence_timeout(pool)
++
++        try:
++            commands = []
++            self._add_external_ids_command(commands, ovn_lb, external_ids)
++            if persistence_timeout:
++                self._add_persistence_timeout_command(commands, ovn_lb,
++                                                      persistence_timeout)
++            self._execute_commands(commands)
++        except Exception as e:
++            LOG.exception(f"Failed to execute commands for pool sync: {e}")
++
+     def pool_delete(self, pool):
+         status = {
+             constants.POOLS: [
+-- 
+2.25.1
+
