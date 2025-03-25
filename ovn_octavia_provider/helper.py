@@ -2765,6 +2765,17 @@ class OvnProviderHelper():
                 return True
         return False
 
+    def _get_vip_lbhc(self, lbhc):
+        vip = lbhc.external_ids.get(ovn_const.LB_EXT_IDS_HM_VIP, '')
+        if vip:
+            return vip
+        else:
+            if lbhc.vip:
+                ip_port = lbhc.vip.rsplit(':', 1)
+                if len(ip_port) == 2:
+                    return ip_port[0]
+        return ''
+
     def handle_vip_fip(self, fip_info):
         ovn_lb = fip_info['ovn_lb']
         external_ids = copy.deepcopy(ovn_lb.external_ids)
@@ -2967,7 +2978,8 @@ class OvnProviderHelper():
     def get_fip_from_vip(self, lb):
         neutron_client = clients.get_neutron_client()
         try:
-            return list(neutron_client.ips(port_id=lb.vip_port_id))
+            return neutron_client.list_floatingips(
+                port_id=lb.vip_port_id)['floatingips']
         except openstack.exceptions.HttpException as e:
             LOG.warn("Error on fetch fip for "
                      f"{lb.loadbalancer_id} "
