@@ -1,0 +1,86 @@
+[DEFAULT]
+
+
+[neutron]
+
+#
+# From octavia.api.drivers.ovn
+#
+
+# DEPRECATED: A new endpoint to override the endpoint in the keystone catalog.
+# (string value)
+# This option is deprecated for removal since Antelope.
+# Its value may be silently ignored in the future.
+# Reason: The endpoint_override option defined by keystoneauth1 is the new name
+# for this option.
+#endpoint = <None>
+
+# DEPRECATED: Endpoint interface in identity service to use (string value)
+# This option is deprecated for removal since Antelope.
+# Its value may be silently ignored in the future.
+# Reason: This option was replaced by the valid_interfaces option defined by
+# keystoneauth.
+#endpoint_type = <None>
+
+# DEPRECATED: CA certificates file path (string value)
+# This option is deprecated for removal since Antelope.
+# Its value may be silently ignored in the future.
+# Reason: The cafile option defined by keystoneauth1 is the new name for this
+# option.
+#ca_certificates_file = <None>
+
+
+[ovn]
+
+#
+# From octavia.api.drivers.ovn
+#
+
+# The connection string for the OVN_Northbound OVSDB.
+# Use tcp:IP:PORT for TCP connection.
+# Use ssl:IP:PORT for SSL connection. The ovn_nb_private_key,
+# ovn_nb_certificate and ovn_nb_ca_cert are mandatory.
+# Use unix:FILE for unix domain socket connection. (string value)
+#ovn_nb_connection = tcp:127.0.0.1:6641
+
+# The PEM file with private key for SSL connection to OVN-NB-DB (string value)
+#ovn_nb_private_key =
+
+# The PEM file with certificate that certifies the private key specified in
+# ovn_nb_private_key (string value)
+#ovn_nb_certificate =
+
+# The PEM file with CA certificate that OVN should use to verify certificates
+# presented to it by SSL peers (string value)
+#ovn_nb_ca_cert =
+
+# The connection string for the OVN_Southbound OVSDB.
+# Use tcp:IP:PORT for TCP connection.
+# Use ssl:IP:PORT for SSL connection. The ovn_sb_private_key,
+# ovn_sb_certificate and ovn_sb_ca_cert are mandatory.
+# Use unix:FILE for unix domain socket connection. (string value)
+#ovn_sb_connection = tcp:127.0.0.1:6642
+
+# The PEM file with private key for SSL connection to OVN-SB-DB (string value)
+#ovn_sb_private_key =
+
+# The PEM file with certificate that certifies the private key specified in
+# ovn_sb_private_key (string value)
+#ovn_sb_certificate =
+
+# The PEM file with CA certificate that OVN should use to verify certificates
+# presented to it by SSL peers (string value)
+#ovn_sb_ca_cert =
+
+# Timeout in seconds for the OVSDB connection transaction (integer value)
+#ovsdb_connection_timeout = 180
+
+# Max interval in seconds between each retry to get the OVN NB and SB IDLs
+# (integer value)
+#ovsdb_retry_max_interval = 180
+
+# The probe interval in for the OVSDB session in milliseconds. If this is zero,
+# it disables the connection keepalive feature. If non-zero the value will be
+# forced to at least 1000 milliseconds. Defaults to 60 seconds. (integer value)
+# Minimum value: 0
+#ovsdb_probe_interval = 60000

@@ -46,7 +46,9 @@ LB_EXT_IDS_HM_POOL_KEY = 'octavia:pool_id'
 LB_EXT_IDS_HM_VIP = 'octavia:vip'
 LB_EXT_IDS_HMS_KEY = 'octavia:healthmonitors'
 LB_EXT_IDS_VIP_KEY = 'neutron:vip'
+LB_EXT_IDS_ADDIT_VIP_KEY = 'neutron:additional_vips'
 LB_EXT_IDS_VIP_FIP_KEY = 'neutron:vip_fip'
+LB_EXT_IDS_ADDIT_VIP_FIP_KEY = 'neutron:additional_vip_fips'
 LB_EXT_IDS_VIP_PORT_ID_KEY = 'neutron:vip_port_id'
 
 PORT_FORWARDING_PLUGIN = 'port_forwarding_plugin'
@@ -80,7 +82,9 @@ REQ_TYPE_EXIT = 'exit'
 
 # Request information constants
 REQ_INFO_ACTION_ASSOCIATE = 'associate'
+REQ_INFO_ACTION_SYNC = 'sync'
 REQ_INFO_ACTION_DISASSOCIATE = 'disassociate'
+
 REQ_INFO_MEMBER_ADDED = 'member_added'
 REQ_INFO_MEMBER_DELETED = 'member_deleted'
 

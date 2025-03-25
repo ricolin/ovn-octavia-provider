@@ -1,0 +1,327 @@
+From 9ba579f5d07dc99c7d6a89ef41f71f89aa4fcb40 Mon Sep 17 00:00:00 2001
+From: ricolin <rlin@vexxhost.com>
+Date: Mon, 24 Mar 2025 18:27:59 +0800
+Subject: [PATCH 9/9] Fix pep8 and function diff
+
+Change-Id: Ie8ed0526c7814905ae7bbdee6b5eec9dc8ab6f79
+---
+ ovn_octavia_provider/common/clients.py   |   1 +
+ ovn_octavia_provider/common/constants.py |   2 +
+ ovn_octavia_provider/driver.py           |  10 +-
+ ovn_octavia_provider/helper.py           | 114 ++++++++++++-----------
+ 4 files changed, 67 insertions(+), 60 deletions(-)
+
+diff --git a/ovn_octavia_provider/common/clients.py b/ovn_octavia_provider/common/clients.py
+index d71101a..38ebb5f 100644
+--- a/ovn_octavia_provider/common/clients.py
++++ b/ovn_octavia_provider/common/clients.py
+@@ -119,6 +119,7 @@ def get_neutron_client():
+         raise driver_exceptions.DriverError(
+             operator_fault_string=msg)
+ 
++
+ class OctaviaAuth(metaclass=Singleton):
+     def __init__(self):
+         """Create Octavia client object."""
+diff --git a/ovn_octavia_provider/common/constants.py b/ovn_octavia_provider/common/constants.py
+index 7789ecb..f628e6f 100644
+--- a/ovn_octavia_provider/common/constants.py
++++ b/ovn_octavia_provider/common/constants.py
+@@ -46,7 +46,9 @@ LB_EXT_IDS_HM_POOL_KEY = 'octavia:pool_id'
+ LB_EXT_IDS_HM_VIP = 'octavia:vip'
+ LB_EXT_IDS_HMS_KEY = 'octavia:healthmonitors'
+ LB_EXT_IDS_VIP_KEY = 'neutron:vip'
++LB_EXT_IDS_ADDIT_VIP_KEY = 'neutron:additional_vips'
+ LB_EXT_IDS_VIP_FIP_KEY = 'neutron:vip_fip'
++LB_EXT_IDS_ADDIT_VIP_FIP_KEY = 'neutron:additional_vip_fips'
+ LB_EXT_IDS_VIP_PORT_ID_KEY = 'neutron:vip_port_id'
+ 
+ PORT_FORWARDING_PLUGIN = 'port_forwarding_plugin'
+diff --git a/ovn_octavia_provider/driver.py b/ovn_octavia_provider/driver.py
+index f5cdd9d..b35b47b 100644
+--- a/ovn_octavia_provider/driver.py
++++ b/ovn_octavia_provider/driver.py
+@@ -118,8 +118,6 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                         'admin_state_up': admin_state_up}
+         if not isinstance(
+                 pool.session_persistence, o_datamodels.UnsetType):
+-            self._check_for_supported_session_persistence(
+-                pool.session_persistence)
+             request_info['session_persistence'] = pool.session_persistence
+ 
+         return request_info
+@@ -329,7 +327,9 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+         _, ovn_lb = self._ovn_helper._find_ovn_lb_by_pool_id(member.pool_id)
+         if not ovn_lb:
+             return False
+-        lb_vip = ovn_lb.external_ids[ovn_const.LB_EXT_IDS_VIP_KEY]
++        lb_vip = ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_VIP_KEY)
++        if not lb_vip:
++            return False
+         return netaddr.IPNetwork(lb_vip).version != (
+             netaddr.IPNetwork(member.address).version)
+ 
+@@ -624,7 +624,6 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                    'info': request_info}
+         self._ovn_helper.add_request(request)
+ 
+-
+     def _ensure_loadbalancer(self, loadbalancer):
+         try:
+             ovn_lbs = self._ovn_helper._find_ovn_lbs_with_retry(
+@@ -746,7 +745,6 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+                     ovn_lb)
+                 self._ovn_helper._update_status_to_octavia(status)
+ 
+-
+     def _fip_sync(self, loadbalancer):
+         LOG.info("Starting sync floating IP for loadbalancer "
+                  f"{loadbalancer.loadbalancer_id}")
+@@ -766,7 +764,7 @@ class OvnProviderDriver(driver_base.ProviderDriver):
+             ovn_const.OVN_PORT_FIP_EXT_ID_KEY) if vip_lsp else None
+ 
+         if fips:
+-            neutron_fip = fips[0].floating_ip_address
++            neutron_fip = fips[0].get('floating_ip_address')
+             if not vip_lsp:
+                 LOG.warn(
+                     "Logic Switch Port not found for port "
+diff --git a/ovn_octavia_provider/helper.py b/ovn_octavia_provider/helper.py
+index 8555507..a54597c 100644
+--- a/ovn_octavia_provider/helper.py
++++ b/ovn_octavia_provider/helper.py
+@@ -434,7 +434,6 @@ class OvnProviderHelper():
+     def _neutron_list_ports(self, neutron_client, **params):
+         return neutron_client.list_ports(**params)
+ 
+-
+     @tenacity.retry(
+         retry=tenacity.retry_if_exception_type(
+             openstack.exceptions.HttpException),
+@@ -462,11 +461,11 @@ class OvnProviderHelper():
+                 vip_address,
+                 subnet_requested
+             )
+-        except openstack.exceptions.ResourceNotFound:
+-            LOG.warn("Load balancer VIP port and subnet not found.")
++        except openstack.exceptions.ResourceNotFound as e:
++            LOG.warn(f"Load balancer VIP port and subnet not found. {e}")
+             return None, None
+-        except AttributeError:
+-            LOG.warn("Load Balancer VIP port missing information.")
++        except AttributeError as e:
++            LOG.warn(f"Load Balancer VIP port missing information. {e}")
+             return None, None
+ 
+     def _build_external_ids(self, loadbalancer, port):
+@@ -474,7 +473,7 @@ class OvnProviderHelper():
+             ovn_const.LB_EXT_IDS_VIP_KEY: loadbalancer.get(
+                 constants.VIP_ADDRESS),
+             ovn_const.LB_EXT_IDS_VIP_PORT_ID_KEY: loadbalancer.get(
+-                constants.VIP_PORT_ID) or port.id,
++                constants.VIP_PORT_ID) or port.get('id'),
+             'enabled': str(loadbalancer.get(constants.ADMIN_STATE_UP))
+         }
+         if loadbalancer.get(constants.ADDITIONAL_VIPS):
+@@ -532,8 +531,8 @@ class OvnProviderHelper():
+                               loadbalancer):
+         # NOTE(ltomasbo): If the VIP is on a provider network, it does
+         # not need to be associated to its LS
+-        network = neutron_client.get_network(port.network_id)
+-        if network and not network.provider_physical_network:
++        network = neutron_client.show_network(port.get('network_id'))['network']
++        if network and not network.get('provider_physical_network'):
+             # NOTE(froyo): This is the association of the lb to the VIP ls
+             # so this is executed right away. For the additional vip ports
+             # this step is not required since all subnets must belong to
+@@ -541,19 +540,19 @@ class OvnProviderHelper():
+ 
+             try:
+                 self._update_lb_to_ls_association(
+-                    ovn_lb, network_id=port.network_id,
+-                    associate=True, update_ls_ref=True, additional_vips=True,
++                    ovn_lb, network_id=port.get('network_id'),
++                    associate=True, update_ls_ref=True,
+                     is_sync=True)
+             except idlutils.RowNotFound:
+                 LOG.warning("The association of loadbalancer %s to the "
+                             "logical switch %s failed, just keep going on",
+-                            ovn_lb.uuid, utils.ovn_uuid(network.name))
+-        ls_name = utils.ovn_name(subnet.network_id)
++                            ovn_lb.uuid, utils.ovn_uuid(network.get('name')))
++        ls_name = utils.ovn_name(subnet['network_id'])
+ 
+         try:
+             ovn_ls = self.ovn_nbdb_api.ls_get(ls_name).execute(
+                 check_error=True)
+-            ovn_lr = self._find_lr_of_ls(ovn_ls, subnet.gateway_ip)
++            ovn_lr = self._find_lr_of_ls(ovn_ls, subnet.get('gateway_ip'))
+         except Exception as e:
+             LOG.warning("OVN Logical Switch or Logical Router not found: "
+                         f"{e}")
+@@ -733,11 +732,11 @@ class OvnProviderHelper():
+         """Retrieve the logical router related to the member's subnet."""
+         neutron_client = clients.get_neutron_client()
+         try:
+-            subnet = neutron_client.get_subnet(member[constants.SUBNET_ID])
+-            ls_name = utils.ovn_name(subnet.network_id)
++            subnet = neutron_client.show_subnet(member[constants.SUBNET_ID])['subnet']
++            ls_name = utils.ovn_name(subnet['network_id'])
+             ovn_ls = self.ovn_nbdb_api.ls_get(ls_name).execute(
+                 check_error=True)
+-            return self._find_lr_of_ls(ovn_ls, subnet.gateway_ip)
++            return self._find_lr_of_ls(ovn_ls, subnet.get('gateway_ip'))
+         except (idlutils.RowNotFound, openstack.exceptions.ResourceNotFound):
+             return None
+ 
+@@ -977,15 +976,6 @@ class OvnProviderHelper():
+                     ls_refs[ls_name] += 1
+                 else:
+                     ls_refs[ls_name] = 1
+-                    # NOTE(froyo): To cover the initial lb to ls association,
+-                    # where additional vips shall be in the same network as VIP
+-                    # port, and the ls_ref[vip_network_id] should take them
+-                    # into account.
+-                    if additional_vips:
+-                        addi_vips = ovn_lb.external_ids.get(
+-                            ovn_const.LB_EXT_IDS_ADDIT_VIP_KEY, '')
+-                        if addi_vips:
+-                            ls_refs[ls_name] += len(addi_vips.split(','))
+                     if ovn_ls:
+                         commands.append(self.ovn_nbdb_api.ls_lb_add(
+                             ovn_ls.uuid, ovn_lb.uuid, may_exist=True))
+@@ -1073,24 +1063,25 @@ class OvnProviderHelper():
+             commands.append(
+                 self.ovn_nbdb_api.lr_lb_add(ovn_lr.uuid, ovn_lb.uuid,
+                                             may_exist=True))
+-
+-        lb_vip = netaddr.IPNetwork(
+-            ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_VIP_KEY))
+-        for net in self._find_ls_for_lr(ovn_lr, ip_version=lb_vip.version):
+-            skip_ls_lb_actions = False
+-            if is_sync:
+-                try:
+-                    ovn_ls = self.ovn_nbdb_api.ls_get(net).execute(
+-                        check_error=True)
+-                    for ls_lb in ovn_ls.load_balancer:
+-                        if str(ls_lb.uuid) == str(ovn_lb.uuid):
+-                            # lb already in ls, skip assocate for sync steps
+-                            skip_ls_lb_actions = True
+-                except idlutils.RowNotFound:
+-                    LOG.warning("LogicalSwitch %s could not be found.", net)
+-            if not skip_ls_lb_actions:
+-                commands.append(self.ovn_nbdb_api.ls_lb_add(
+-                    net, ovn_lb.uuid, may_exist=True))
++        vip = ovn_lb.external_ids.get(ovn_const.LB_EXT_IDS_VIP_KEY)
++        if vip:
++            lb_vip = netaddr.IPNetwork(vip)
++            for net in self._find_ls_for_lr(ovn_lr, ip_version=lb_vip.version):
++                skip_ls_lb_actions = False
++                if is_sync:
++                    try:
++                        ovn_ls = self.ovn_nbdb_api.ls_get(net).execute(
++                            check_error=True)
++                        for ls_lb in ovn_ls.load_balancer:
++                            if str(ls_lb.uuid) == str(ovn_lb.uuid):
++                                # lb already in ls, skip assocate for sync steps
++                                skip_ls_lb_actions = True
++                    except idlutils.RowNotFound:
++                        LOG.warning("LogicalSwitch %s could not be found.",
++                                    net)
++                if not skip_ls_lb_actions:
++                    commands.append(self.ovn_nbdb_api.ls_lb_add(
++                        net, ovn_lb.uuid, may_exist=True))
+ 
+         if ovn_lr.name not in str(lr_rf):
+             # Multiple routers in lr_rf are separated with ','
+@@ -1278,7 +1269,7 @@ class OvnProviderHelper():
+         if lb_external_ids.get('enabled') == 'False':
+             return vip_ips
+ 
+-        lb_vip = lb_external_ids[ovn_const.LB_EXT_IDS_VIP_KEY]
++        lb_vip = lb_external_ids.get(ovn_const.LB_EXT_IDS_VIP_KEY)
+         vip_fip = lb_external_ids.get(ovn_const.LB_EXT_IDS_VIP_FIP_KEY)
+ 
+         for k, v in lb_external_ids.items():
+@@ -1304,7 +1295,7 @@ class OvnProviderHelper():
+                     )
+                     ips.append(mb_ip_formatted)
+ 
+-            if ips:
++            if ips and lb_vip:
+                 lb_vip_formatted = (
+                     f'[{lb_vip}]'
+                     if netaddr.IPNetwork(lb_vip).version == 6
+@@ -1360,22 +1351,25 @@ class OvnProviderHelper():
+         port = None
+         subnet = None
+         if port_id:
+-            port = neutron_client.get_port(port_id)
+-            for ip in port.fixed_ips:
++            port = neutron_client.show_port(port_id)['port']
++            for ip in port.get('fixed_ips', set()):
+                 if ip.get('ip_address') == address:
+                     if subnet_required:
+-                        subnet = neutron_client.get_subnet(ip.get('subnet_id'))
++                        subnet = neutron_client.show_subnet(
++                            ip.get('subnet_id')
++                        )['subnet']
+                     break
+         elif network_id and address:
+             ports = self._neutron_list_ports(neutron_client,
+-                                             network_id=network_id)
++                                             network_id=network_id)['ports']
+             for p in ports:
+-                for ip in p.fixed_ips:
++                for ip in p.get('fixed_ips', set()):
+                     if ip.get('ip_address') == address:
+                         port = p
+                         if subnet_required:
+-                            subnet = neutron_client.get_subnet(
+-                                ip.get('subnet_id'))
++                            subnet = neutron_client.show_subnet(
++                                ip.get('subnet_id')
++                            )['subnet']
+                         break
+         return port, subnet
+ 
+@@ -2775,6 +2769,17 @@ class OvnProviderHelper():
+                 return True
+         return False
+ 
++    def _get_vip_lbhc(self, lbhc):
++        vip = lbhc.external_ids.get(ovn_const.LB_EXT_IDS_HM_VIP, '')
++        if vip:
++            return vip
++        else:
++            if lbhc.vip:
++                ip_port = lbhc.vip.rsplit(':', 1)
++                if len(ip_port) == 2:
++                    return ip_port[0]
++        return ''
++
+     def handle_vip_fip(self, fip_info):
+         ovn_lb = fip_info['ovn_lb']
+         external_ids = copy.deepcopy(ovn_lb.external_ids)
+@@ -2977,7 +2982,8 @@ class OvnProviderHelper():
+     def get_fip_from_vip(self, lb):
+         neutron_client = clients.get_neutron_client()
+         try:
+-            return list(neutron_client.ips(port_id=lb.vip_port_id))
++            return neutron_client.list_floatingips(
++                port_id=lb.vip_port_id)['floatingips']
+         except openstack.exceptions.HttpException as e:
+             LOG.warn("Error on fetch fip for "
+                      f"{lb.loadbalancer_id} "
+@@ -3567,7 +3573,7 @@ class OvnProviderHelper():
+         :param pool_key: The pool_key where health monitor is associated
+         """
+         lbhcs, ovn_lb = self._find_ovn_lb_from_hm_id(hm[constants.ID])
+-        if not lbhcs:
++        if not lbhcs or not ovn_lb:
+             LOG.debug("Loadbalancer health check %s not found!",
+                       hm[constants.ID])
+             # Create in case we don't found it
+-- 
+2.25.1
+
